@@ -1650,12 +1650,10 @@ class MQASelfAttention(MLASelfAttention):
         assert rotary_pos_cos is None and rotary_pos_sin is None, (
             "MQA does not support Flash Decoding"
         )
-        assert not get_context_parallel_world_size() > 1, (
-            "MQA does not support context parallel."
-        )
-        assert get_pg_size(self.pg_collection.tp) == 1, (
-            "MQA does not support tensor parallel."
-        )
+        if get_context_parallel_world_size() > 1:
+            raise ValueError("MQA does not support context parallel.")
+        if get_pg_size(self.pg_collection.tp) != 1:
+            raise ValueError("MQA does not support tensor parallel.")
 
         if not self.is_mqa:
             return super().forward(

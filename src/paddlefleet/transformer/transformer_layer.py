@@ -1719,6 +1719,7 @@ class HySparseTransformerLayer(TransformerLayer):
                 attention_bias=dict_args.get("attention_bias", None),
                 packed_seq_params=dict_args.get("packed_seq_params", None),
                 input_ids=dict_args.get("input_ids", None),
+                origin_input_ids=dict_args.get("origin_input_ids", None),
                 shared_key=dict_args.get("shared_key", None),
                 shared_block_indices=dict_args.get(
                     "shared_block_indices", None
@@ -1765,6 +1766,7 @@ class HySparseTransformerLayer(TransformerLayer):
         input_ids: Tensor | None = None,
         shared_key: Tensor | None = None,
         shared_block_indices: Tensor | None = None,
+        origin_input_ids: Tensor | None = None,
         **kwargs,
     ):
         timer_name = "moe-mlp" if isinstance(self.mlp, MoELayer) else "mlp"
@@ -1814,7 +1816,11 @@ class HySparseTransformerLayer(TransformerLayer):
         )
         self._log_md5(hidden_states, "post_attn_residual", self.layer_number)
         with profile(timer_name):
-            output = self._forward_mlp(hidden_states, input_ids=input_ids)
+            output = self._forward_mlp(
+                hidden_states,
+                input_ids=input_ids,
+                origin_input_ids=origin_input_ids,
+            )
         self._log_md5(output, "layer_output", self.layer_number)
 
         if (not self.self_attn.is_swa) and shared_kv:
