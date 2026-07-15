@@ -1559,23 +1559,19 @@ class MQASelfAttention(MLASelfAttention):
             self.core_attention.k_channels = k_channels
             self.core_attention.v_channels = v_channels
 
-            # Block sparse attention
-            self.sparse_core_attention = build_spec_layer(
-                sublayers_spec.core_attention,
-                config=self.core_attention.config,
-                layer_number=self.layer_number,
-                attn_mask_type=self.attn_mask_type,
-                attention_type=self.attention_type,
-                is_mtp_layer=self.is_mtp_layer,
-                is_swa=False,
-                softmax_scale=self.config.softmax_scale,
-                k_channels=k_channels,
-                v_channels=v_channels,
-                num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=1,
-                cp_comm_type=cp_comm_type,
-                pg_collection=self.pg_collection,
-            )
+            # The MQA path never calls ``self.core_attention(...)`` (it runs the
+            # TileLang / cuDNN MQA kernels directly), so the ``softmax_offset``
+            # that DotProductAttention registers for SWA layers under
+            # ``add_swa_attention_sink_bias`` never participates in the forward
+            # and keeps a zero gradient, tripping distributed unused-parameter
+            # checks. The real sink logits live in ``swa_attn_sink`` /
+            # ``sparse_attn_sink`` below, so drop this redundant parameter.
+            # ``del`` goes through ``paddle.nn.Layer.__delattr__`` which removes
+            # the entry from ``_parameters``; reset to ``None`` afterwards so any
+            # generic ``core_attention.softmax_offset`` lookup still resolves.
+            if getattr(self.core_attention, "softmax_offset", None) is not None:
+                del self.core_attention.softmax_offset
+                self.core_attention.softmax_offset = None
 
             # Gate for block sparse attention
             if self.gated_attention:
