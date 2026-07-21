@@ -92,17 +92,25 @@ def build_hysparse_valid_range(
         # every downstream bos -> block bucket. Assert the structural shape
         # (host-side, free) so such a change fails loudly here instead of
         # silently mis-bucketing.
-        assert attn_mask_startend_row_indices.ndim == 4, (
-            "attn_mask_startend_row_indices must be 4-D "
-            "[B, num_masks, S, num_bounds] so [:, 0, :, 0] is the per-token "
-            f"exclusive doc-end; got ndim={attn_mask_startend_row_indices.ndim} "
-            f"shape={attn_mask_startend_row_indices.shape}"
-        )
-        assert attn_mask_startend_row_indices.shape[2] == seq_len, (
-            "attn_mask_startend_row_indices axis-2 must be the query length S="
-            f"{seq_len}; got shape={attn_mask_startend_row_indices.shape} "
-            "(layout changed? [:, 0, :, 0] would no longer be the doc-end)"
-        )
+        # Use explicit raises (not assert): this is a production forward path
+        # and asserts are stripped under `python -O`, which would let a changed
+        # upstream layout silently mis-bucket every bos -> block instead of
+        # failing loudly here.
+        if attn_mask_startend_row_indices.ndim != 4:
+            raise ValueError(
+                "attn_mask_startend_row_indices must be 4-D "
+                "[B, num_masks, S, num_bounds] so [:, 0, :, 0] is the "
+                "per-token exclusive doc-end; got ndim="
+                f"{attn_mask_startend_row_indices.ndim} "
+                f"shape={attn_mask_startend_row_indices.shape}"
+            )
+        if attn_mask_startend_row_indices.shape[2] != seq_len:
+            raise ValueError(
+                "attn_mask_startend_row_indices axis-2 must be the "
+                f"query length S={seq_len}; got shape="
+                f"{attn_mask_startend_row_indices.shape} "
+                "(layout changed? [:, 0, :, 0] would no longer be the doc-end)"
+            )
         # [B, *, S, *] -> [B_mask, S] exclusive document end per token.
         de = attn_mask_startend_row_indices[:, 0, :, 0].cast("int64")  # [Bm, S]
         # The flashmask row indices may carry a batch of 1 that broadcasts over
@@ -1909,12 +1917,17 @@ class MQASelfAttention(MLASelfAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
 
-        assert self.config.rope_type == "rope", (
-            f"MQA only supports rope_type 'rope', got {self.config.rope_type}"
-        )
-        assert packed_seq_params is None, (
-            "MQA doesn't support packed_seq_params"
-        )
+        # Explicit raises (not assert): production forward path, asserts are
+        # stripped under `python -O` and an unsupported rope_type /
+        # packed_seq_params would then silently feed the RoPE/TileLang/DSA
+        # kernels instead of failing here.
+        if self.config.rope_type != "rope":
+            raise ValueError(
+                "MQA only supports rope_type 'rope', got "
+                f"{self.config.rope_type}"
+            )
+        if packed_seq_params is not None:
+            raise ValueError("MQA doesn't support packed_seq_params")
 
         rotary_pos_emb = self.rotary_pos_emb(
             rotary_seq_len,
