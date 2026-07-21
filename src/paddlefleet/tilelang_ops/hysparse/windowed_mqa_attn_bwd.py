@@ -67,7 +67,7 @@ def windowed_mqa_bwd(
     block_M=64,
     block_N=64,
     block_B=64,
-    num_stages=1,
+    num_stages=2,
     threads=128,
 ):
     if D_v is None:
@@ -288,17 +288,25 @@ def windowed_mqa_bwd(
     return main
 
 
-def _fit_block_mn(D, block_B, D_v=None, cap_bytes=230000):
-    """Pick (block_M, block_N) maximising the query tile then the key sub-tile.
+def _fit_block_mn(
+    D, block_B, D_v=None, cap_bytes=230000, threads=128, reg_cap=320
+):
+    """Pick (block_M, block_N) fitting BOTH shared memory and the register file.
 
     The backward holds Q ``[block_M, D]`` + dO ``[block_M, D_v]`` + K
     ``[block_N, D]`` + V ``[block_N, D_v]`` + P/dS ``[block_M, block_N]`` in
-    bf16 shared memory (dQ writes straight from its accumulator). Prefer the
-    largest ``block_M`` (<=64) -- big M matches the forward's tensor-core
-    utilisation and K/V amortisation -- and, for that M, the largest
-    ``block_N`` (dividing ``block_B``) that fits. At MLA D=576 a full
-    block_M=64 needs block_N=32 to fit Blackwell's ~227 KB; small dims (D=64)
-    keep block_N=block_B (single-tile fast path).
+    bf16 shared memory (dQ writes straight from its accumulator) AND six fp32
+    accumulator fragments in registers -- acc_s/acc_p/acc_dp ``[BM, BN]``,
+    acc_dq ``[BM, D]``, acc_dk ``[BN, D]``, acc_dv ``[BN, D_v]``.
+
+    At large head dims (absorbed-MLA D=512/576) a full ``block_M=64`` blows the
+    ~255-reg/thread budget: the accumulators spill to local memory (measured on
+    B30Z SM100 as billions of local-mem sectors, ~2.4x slower and <7% tensor-
+    pipe util) even though the *shared*-memory check alone still passes. So gate
+    on an estimated per-thread accumulator register count as well, and take the
+    largest tile that fits BOTH. At D=512 this now selects (32, 16) over the
+    spilling (64, 32); at small dims (D=64) it keeps the (64, block_B) single-
+    tile fast path. The result is mathematically identical for any valid tile.
     """
     if D_v is None:
         D_v = D
@@ -307,7 +315,10 @@ def _fit_block_mn(D, block_B, D_v=None, cap_bytes=230000):
     for bm in (64, 48, 32, 16):
         for bn in cands_n:
             shared = 2 * (bm * (D + D_v) + bn * (D + D_v) + 2 * bm * bn)
-            if shared <= cap_bytes:
+            # fp32 accumulator fragments live in registers, spread over `threads`;
+            # this per-thread element count tracks register pressure / spilling.
+            regs = (bm * D + bn * D + bn * D_v + 3 * bm * bn) / threads
+            if shared <= cap_bytes and regs <= reg_cap:
                 return bm, bn
     return 16, min(16, block_B)
 
