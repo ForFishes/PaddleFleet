@@ -802,6 +802,12 @@ class MultiLatentAttention(Attention):
             select_topk_blocks,
         )
 
+        use_tl = getattr(self.config, "hy_sparse_full_attn_use_tilelang", False)
+        if use_tl:
+            from paddlefleet.tilelang_ops.hysparse.block_score_mha import (
+                block_score_mha_attn_fwd,
+            )
+
         b, s, h, _dv = value.shape
         block_B = self.config.hy_sparse_block_size
         topk = self.config.hy_sparse_topk
@@ -818,16 +824,29 @@ class MultiLatentAttention(Attention):
             attn_mask_startend_row_indices, s, b
         )
 
-        out, lse, block_logit = block_score_fa4_attn_fwd(
-            query,
-            key,
-            value,
-            valid_range=valid_range,
-            sm_scale=sm_scale,
-            block_B=block_B,
-            causal=True,
-            startend_row_indices=attn_mask_startend_row_indices,
-        )
+        if use_tl:
+            # Independent TileLang MHA scorer: masks purely via valid_range
+            # (document + causal), no flashmask input needed.
+            out, lse, block_logit = block_score_mha_attn_fwd(
+                query,
+                key,
+                value,
+                valid_range=valid_range,
+                sm_scale=sm_scale,
+                block_B=block_B,
+                causal=True,
+            )
+        else:
+            out, lse, block_logit = block_score_fa4_attn_fwd(
+                query,
+                key,
+                value,
+                valid_range=valid_range,
+                sm_scale=sm_scale,
+                block_B=block_B,
+                causal=True,
+                startend_row_indices=attn_mask_startend_row_indices,
+            )
         block_indices = select_topk_blocks(
             block_logit,
             lse,
@@ -1703,11 +1722,11 @@ class MQASelfAttention(MLASelfAttention):
         sm_scale = self.softmax_scale
         window_size = self.config.sliding_window[0]
 
-        # Absorbed-MLA MQA: a single shared K/V head with Dk=576 (kv_lora_rank +
-        # qk_rope_head_dim) / Dv=512 (kv_lora_rank). Squeeze the head axis to the
-        # [B, S_kv, D] layout the TileLang MQA kernels expect.
-        shared_k = key.squeeze(2).contiguous()  # [B, S, 576]
-        shared_v = value.squeeze(2).contiguous()  # [B, S, 512]
+        # Absorbed-MLA MQA: one shared K/V head with
+        # Dk=kv_lora_rank+qk_rope_head_dim and Dv=kv_lora_rank. Squeeze the head
+        # axis to the [B, S_kv, D] layout the TileLang MQA kernels expect.
+        shared_k = key.squeeze(2).contiguous()
+        shared_v = value.squeeze(2).contiguous()
 
         # Windowed valid_range for the sliding-window main path; document-anchored
         # valid_range (no window clamp) for the block-sparse branch so its blocks
@@ -1719,7 +1738,7 @@ class MQASelfAttention(MLASelfAttention):
             attn_mask_startend_row_indices, s, b
         )
 
-        # Sliding-window main path (MQA, Dk=576/Dv=512).
+        # Sliding-window main path over the absorbed MQA dimensions.
         core_attn_out, _ = sliding_window_mqa_attention(
             query,
             shared_k,
@@ -1770,36 +1789,53 @@ class MQASelfAttention(MLASelfAttention):
         # =================
 
         shared_key, shared_block_indices = shared_kv
-        # Shared compressed KV latent from the full layer: [B, S, 1, 576].
-        # Squeeze to [B, S_kv, D] and split into key (576) / value (512).
-        shared_key_sq = shared_key.squeeze(2).contiguous()  # [B, S, 576]
+        # Shared compressed KV latent from the full layer, with
+        # Dk=kv_lora_rank+qk_rope_head_dim. Squeeze to [B, S_kv, D]; its leading
+        # kv_lora_rank channels are the values.
+        shared_key_sq = shared_key.squeeze(2).contiguous()
 
-        # Block-sparse gather branch: DeepSeek-v4's CSA sparse attention
-        # (FlashMLA sparse fwd + cuDNN DSA bwd). It routes the HySparse block
-        # selection through DSA's token-level sparse path and natively handles
-        # the absorbed-MQA Dk=576 / Dv=512 shared-head layout (value == leading
-        # kv_lora_rank slice of the shared latent).
-        from paddlefleet.cudnn_ops import (
-            block_sparse_mqa_attention_dsa,
-            is_dsa_available,
+        # Block-sparse gather branch over the absorbed-MQA shared-head layout
+        # (value == the leading kv_lora_rank slice of the shared latent).
+        use_tl = getattr(
+            self.config, "hy_sparse_block_sparse_use_tilelang", False
         )
-
-        if not is_dsa_available():
-            raise RuntimeError(
-                "HySparse block-sparse attention requires the DSA backend "
-                "(FlashMLA sparse fwd + cuDNN DSA bwd), unavailable here: it "
-                "needs SM100 + FlashMLA + the cuDNN frontend."
+        if use_tl:
+            from paddlefleet.tilelang_ops.hysparse.block_sparse_mqa_tl import (
+                block_sparse_mqa_attention_tl,
             )
-        sparse_core_attn_out, _ = block_sparse_mqa_attention_dsa(
-            query,
-            shared_key_sq,
-            shared_block_indices,
-            doc_valid_range,
-            sm_scale=sm_scale,
-            block_B=block_B,
-            kv_lora_rank=self.config.kv_lora_rank,
-            attn_sink=getattr(self, "sparse_attn_sink", None),
-        )
+
+            sparse_core_attn_out, _ = block_sparse_mqa_attention_tl(
+                query,
+                shared_key_sq,
+                shared_block_indices,
+                doc_valid_range,
+                sm_scale=sm_scale,
+                block_B=block_B,
+                kv_lora_rank=self.config.kv_lora_rank,
+                attn_sink=getattr(self, "sparse_attn_sink", None),
+            )
+        else:
+            from paddlefleet.cudnn_ops import (
+                block_sparse_mqa_attention_dsa,
+                is_dsa_available,
+            )
+
+            if not is_dsa_available():
+                raise RuntimeError(
+                    "HySparse block-sparse attention requires the DSA backend "
+                    "(FlashMLA sparse fwd + cuDNN DSA bwd), unavailable here: it "
+                    "needs SM100 + FlashMLA + the cuDNN frontend."
+                )
+            sparse_core_attn_out, _ = block_sparse_mqa_attention_dsa(
+                query,
+                shared_key_sq,
+                shared_block_indices,
+                doc_valid_range,
+                sm_scale=sm_scale,
+                block_B=block_B,
+                kv_lora_rank=self.config.kv_lora_rank,
+                attn_sink=getattr(self, "sparse_attn_sink", None),
+            )
         sparse_core_attn_out = sparse_core_attn_out.reshape(
             [
                 b,

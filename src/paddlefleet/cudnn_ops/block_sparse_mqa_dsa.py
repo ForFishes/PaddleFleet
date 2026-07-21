@@ -48,6 +48,8 @@ zero-padded up to 64 when ``H < 64`` (padded heads receive zero output gradient
 and contribute no KV gradient).
 """
 
+import os
+
 import paddle
 
 _DSA_HEADS = 64  # FlashMLA sparse fwd only supports h_q == 64 on SM100.
@@ -242,8 +244,42 @@ class _BlockSparseDSA(paddle.autograd.PyLayer):
         o_flat = out.reshape([b * s, hpad, d_v])
         do_flat = do.reshape([b * s, hpad, d_v])
         kv_flat = kv.reshape([b * skv, dk])
-        lse_flat = lse.reshape([b * s, hpad])
         gidx_flat = _local_to_global_flat(token_indices, skv)
+
+        # dq/dkv softmax normalization for the finite-sink absorbed-MQA path.
+        #
+        # The forward output was formed with the sink competing in the softmax
+        # denominator: p_k = exp(l_k - lse_full), lse_full = logaddexp(lse_kv,
+        # sink). But the forward kernel returns a KV-only ``lse`` (the sink is
+        # excluded), and the cuDNN DSA backward's ``d_qk != d_v`` branch (the
+        # absorbed-MQA Dk=576 / Dv=512 layout used here) consumes the passed LSE
+        # verbatim -- it does NOT fold the sink into the denominator itself.
+        # Feeding it the KV-only LSE therefore overestimates every p_k for a
+        # finite sink and corrupts dq (confirmed: packed finite-sink dQ cos
+        # 0.976 vs the dense reference). Fix: for a finite (learnable) sink on
+        # this Dk!=Dv path, pass a sink-inclusive LSE and neutralize the sink
+        # argument (a -1e30 sink can no longer double-count in the kernel), so
+        # p_k matches the forward exactly.
+        #
+        # Sinkless keeps the KV-only ``lse`` and the -1e30 ``sink`` untouched
+        # (logaddexp(lse, -1e30) == lse), so that path is bit-for-bit unchanged.
+        # The analytic d_sink below intentionally keeps using the original
+        # KV-only ``lse`` (it re-derives lse_full from it).
+        lse_bwd = lse
+        sink_bwd = sink
+        # [ablation gate] HYSPARSE_DSA_FINITE_SINK_FIX=0 disables the finite-sink
+        # LSE correction to reproduce the exact online (v2) DSA backward behavior
+        # (KV-only LSE fed verbatim). Default on (=1). Root-cause confirmation only.
+        _dsa_finite_sink_fix = (
+            os.environ.get("HYSPARSE_DSA_FINITE_SINK_FIX", "1") != "0"
+        )
+        if _dsa_finite_sink_fix and ctx.learnable_sink and dk != d_v:
+            lse_bwd = paddle.logaddexp(
+                lse.astype("float32"),
+                sink.astype("float32").reshape([1, 1, hpad]),
+            ).astype(lse.dtype)
+            sink_bwd = paddle.full([hpad], _NEG_SINK, dtype="float32")
+        lse_flat = lse_bwd.reshape([b * s, hpad])
 
         dq_flat, dkv_flat, _d_sink_unused = csa_sparse_attn_bwd_cudnn(
             q_flat,
@@ -251,7 +287,7 @@ class _BlockSparseDSA(paddle.autograd.PyLayer):
             o_flat,
             do_flat,
             lse_flat,
-            sink,
+            sink_bwd,
             gidx_flat,
             softmax_scale=ctx.sm_scale,
         )

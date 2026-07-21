@@ -26,9 +26,23 @@ autograd wrapper (including its ``sm_scale=None`` default).
 """
 
 import math
+import os
+import sys
 import unittest
 
 import paddle
+
+# Test-only precision metrics live one directory up (single_card_tests/).
+_TESTS_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), os.pardir)
+)
+if _TESTS_ROOT not in sys.path:
+    sys.path.insert(0, _TESTS_ROOT)
+from _hysparse_metrics import assert_close
+
+from paddlefleet.tilelang_ops.hysparse.reference_sparse import (
+    make_causal_valid_range,
+)
 
 paddle.enable_compat(scope={"tilelang"}, silent=True)
 
@@ -423,6 +437,86 @@ class TestWindowedMQAAttnSink(unittest.TestCase):
         self.assertIsNotNone(sink_k.grad)
         self.assertGreater(_cos(qk.grad, qr.grad), 0.99)
         self.assertGreater(_cos(sink_k.grad, sink_r.grad), 0.99)
+
+
+class TestPackedMultiDocBackward(unittest.TestCase):
+    """Packed multi-document (nonzero-bos) fwd+bwd precision on the SWA path.
+
+    A single packed sequence of documents ``[40, 88, 133, 27]`` (S=288) with
+    per-document causal masking (``bos`` = doc start, nonzero for docs 2..4)
+    exercises the doc-boundary masking in both directions. We compare the fused
+    kernel's output and its dQ/dK/dV (and dSink, for the learnable-sink case)
+    against the differentiable dense masked reference using the shared metrics
+    helper, which prints max-abs / max-rel / RMSE / cosine / allclose for each.
+    """
+
+    BLOCK_B = 64
+    DOC_LENS = [40, 88, 133, 27]
+
+    def _run(self, attn_sink_seed=None):
+        from paddlefleet.tilelang_ops.hysparse.swa_attn import (
+            sliding_window_mqa_attention,
+        )
+
+        b, h, d, dv = 1, 8, 64, 64
+        s = sum(self.DOC_LENS)
+        s_kv = s
+        q, k, v = _rand_inputs(b, s, h, d, dv, s_kv, seed=101)
+        vr = make_causal_valid_range(s, batch=b, doc_lengths=self.DOC_LENS)
+        sm_scale = 1.0 / math.sqrt(d)
+
+        qk = q.astype("bfloat16").detach()
+        kk = k.astype("bfloat16").detach()
+        vk = v.astype("bfloat16").detach()
+        leaves = [qk, kk, vk]
+        sink_k = None
+        if attn_sink_seed is not None:
+            paddle.seed(attn_sink_seed)
+            sink_k = paddle.randn([h], dtype="float32").detach()
+            leaves.append(sink_k)
+        for t in leaves:
+            t.stop_gradient = False
+        out, _ = sliding_window_mqa_attention(
+            qk,
+            kk,
+            vk,
+            vr,
+            attn_sink=sink_k,
+            sm_scale=sm_scale,
+            block_B=self.BLOCK_B,
+        )
+        g = paddle.randn(out.shape, dtype="float32").astype("bfloat16")
+        out.backward(g)
+
+        qr = q.detach()
+        kr = k.detach()
+        vr_ = v.detach()
+        ref_leaves = [qr, kr, vr_]
+        sink_r = None
+        if sink_k is not None:
+            sink_r = sink_k.detach().astype("float32")
+            ref_leaves.append(sink_r)
+        for t in ref_leaves:
+            t.stop_gradient = False
+        allow = _window_allow_mask(vr, s_kv)
+        ref = _ref_masked_attn(qr, kr, vr_, allow, sm_scale, attn_sink=sink_r)
+        ref.backward(g.astype("float32"))
+
+        assert_close(self, "out", out, ref, min_cos=0.99)
+        assert_close(self, "dQ", qk.grad, qr.grad, min_cos=0.99)
+        assert_close(self, "dK", kk.grad, kr.grad, min_cos=0.99)
+        assert_close(self, "dV", vk.grad, vr_.grad, min_cos=0.99)
+        if sink_k is not None:
+            self.assertIsNotNone(sink_k.grad)
+            assert_close(self, "dSink", sink_k.grad, sink_r.grad, min_cos=0.99)
+
+    def test_packed_multidoc_backward_sinkless(self):
+        _skip_if_no_cuda(self)
+        self._run(attn_sink_seed=None)
+
+    def test_packed_multidoc_backward_learnable_sink(self):
+        _skip_if_no_cuda(self)
+        self._run(attn_sink_seed=53)
 
 
 if __name__ == "__main__":

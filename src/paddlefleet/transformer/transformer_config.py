@@ -842,6 +842,41 @@ class TransformerConfig(ModelParallelConfig):
     to k / block_size = 1024 / 64 = 16 blocks. This field counts blocks, so 16 is
     the block-space equivalent of the paper's 1024-token budget."""
 
+    hy_sparse_full_attn_use_tilelang: bool = False
+    """Route the HySparse **full-attention block-score** branch through the
+    independent TileLang operator (``block_score_mha_attn_fwd``) instead of the
+    production FA4 fused block-score kernel (``block_score_fa4_attn_fwd``).
+
+    Independent from :attr:`hy_sparse_block_sparse_use_tilelang`: the full-score
+    and block-sparse-gather branches each pick their backend separately, so you
+    can mix (e.g. TileLang scorer + production DSA gather) to isolate which
+    branch an anomaly comes from.
+
+    Set from the training YAML as a top-level key::
+
+        enable_hy_sparse_attention: true
+        hy_sparse_full_attn_use_tilelang: true      # default false -> FA4
+
+    The TileLang op is numerically cross-checked against FA4 (bf16-level fwd+bwd
+    agreement, exact block_logit and TopK-index bridge). Leave ``False`` for
+    production runs (FA4 is faster)."""
+
+    hy_sparse_block_sparse_use_tilelang: bool = False
+    """Route the HySparse **block-sparse gather** branch through the independent
+    TileLang operator (``block_sparse_mqa_attention_tl``) instead of the
+    production cuDNN-DSA gather kernel (``block_sparse_mqa_attention_dsa``).
+
+    Independent from :attr:`hy_sparse_full_attn_use_tilelang` (see there).
+
+    Set from the training YAML as a top-level key::
+
+        enable_hy_sparse_attention: true
+        hy_sparse_block_sparse_use_tilelang: true   # default false -> DSA
+
+    The TileLang op is numerically cross-checked against DSA (bf16-level fwd+bwd
+    agreement) and needs no head padding / handles any ``kv_lora_rank`` natively.
+    Leave ``False`` for production runs (DSA is faster)."""
+
     # cache_mla_latents: bool = False
 
     ####################
