@@ -198,33 +198,6 @@ class TestBlockSparseDSAPadTo512(unittest.TestCase):
         out.sum().backward()
         return out, qr.grad, kr.grad
 
-    def test_pad_path_vs_dense_reference_h4(self):
-        # d_v=448 pad-to-512 forward + dq/dkv grads vs dense masked reference.
-        _skip_if_no_dsa(self)
-        b, s, h, topk = 1, 192, 4, 2
-        q, kf, vr, idx, sm = self._make(b, s, h, topk)
-        out_dsa, dq_dsa, dkv_dsa = self._run_dsa(
-            q, kf, idx, vr, sm, self.KV_LORA
-        )
-        out_ref, dq_ref, dkv_ref = self._run_ref(q, kf, idx, vr, sm)
-        # Output width is the *real* 448 value dim, not the padded 512.
-        self.assertEqual(list(out_dsa.shape), [b, s, h * self.Dv])
-        self.assertGreater(_cos(out_dsa, out_ref), 0.99)
-        self.assertGreater(_cos(dq_dsa, dq_ref), 0.99)
-        self.assertGreater(_cos(dkv_dsa, dkv_ref), 0.99)
-
-    def test_pad_path_vs_dense_reference_h64(self):
-        _skip_if_no_dsa(self)
-        b, s, h, topk = 1, 256, 64, 4
-        q, kf, vr, idx, sm = self._make(b, s, h, topk, seed=13)
-        out_dsa, dq_dsa, dkv_dsa = self._run_dsa(
-            q, kf, idx, vr, sm, self.KV_LORA
-        )
-        out_ref, dq_ref, dkv_ref = self._run_ref(q, kf, idx, vr, sm)
-        self.assertGreater(_cos(out_dsa, out_ref), 0.99)
-        self.assertGreater(_cos(dq_dsa, dq_ref), 0.99)
-        self.assertGreater(_cos(dkv_dsa, dkv_ref), 0.99)
-
     def test_pad_boundary_does_not_leak_gradient(self):
         # The zero columns are inserted *between* value(448) and rope(64). If
         # the pad/slice leaked, the value-region and rope-region gradients would

@@ -57,12 +57,23 @@ _NEG_SINK = -1e30  # sink so large-negative that exp(sink - m) underflows to 0.
 
 
 def is_dsa_available() -> bool:
-    """Whether the FlashMLA sparse fwd + cuDNN DSA bwd path can run here."""
+    """Whether the FlashMLA sparse fwd + cuDNN DSA bwd path can run here.
+
+    The DSA fwd/bwd kernels are only implemented for SM100+ (Blackwell); there
+    is no eager fallback below it. The cuDNN DSA *backward* additionally does a
+    bare ``import cudnn`` (the NVIDIA cuDNN python frontend) at call time, which
+    ``paddlefleet_ops.is_cudnn_frontend_available()`` (an ops-level probe) does
+    NOT cover. Probe both here so environments missing either -- e.g. an SM90
+    H20 CI box without the ``cudnn`` wheel -- report unavailable and skip the
+    path instead of failing deep inside the backward.
+    """
     try:
         import paddlefleet_ops
 
         from paddlefleet.cudnn_ops.attn import csa_sparse_attn_fwd_cudnn
 
+        if paddle.device.cuda.get_device_capability()[0] < 10:
+            return False
         if (
             not paddlefleet_ops.is_flash_mla_available()
             or csa_sparse_attn_fwd_cudnn._flash_mla_sparse_fwd is None
@@ -70,6 +81,9 @@ def is_dsa_available() -> bool:
             return False
         if not paddlefleet_ops.is_cudnn_frontend_available():
             return False
+        # The backward's ``import cudnn`` python frontend is a separate wheel
+        # from the ops-level frontend checked above.
+        import cudnn  # noqa: F401
     except (ImportError, RuntimeError, AttributeError):
         return False
     return True

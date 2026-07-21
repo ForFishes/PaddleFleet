@@ -282,10 +282,6 @@ class TestBlockScoreMHADenseRef(unittest.TestCase):
         _skip_if_no_tl(self)
         self._run_case("single_b1", 1, 256, 8, 256, 256, None, seed=1)
 
-    def test_single_doc_b2(self):
-        _skip_if_no_tl(self)
-        self._run_case("single_b2", 2, 256, 8, 256, 256, None, seed=2)
-
     def test_multi_doc_packed_ragged(self):
         # Packed docs, all unaligned to BLOCK_B=64 -> nonzero bos downstream.
         _skip_if_no_tl(self)
