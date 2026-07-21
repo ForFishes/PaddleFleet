@@ -1529,6 +1529,20 @@ class TransformerConfig(ModelParallelConfig):
                         "boundary. Set the MTP entries to 0."
                     )
 
+        # HySparse: the block-score (FA4) and block-sparse (DSA) backends only
+        # support hy_sparse_block_size == 64. The FA4 block-score op requires
+        # 128 % block_B == 0 and the SM100 DSA block-sparse gather requires
+        # block_B == 64 (one block == one TopK tile chunk). Other values either
+        # silently mis-bucket keys or fail deep in the CUDA kernels, so reject
+        # them up front.
+        if self.enable_hy_sparse_attention and self.hy_sparse_block_size != 64:
+            raise ValueError(
+                "hy_sparse_block_size must be 64 when enable_hy_sparse_attention "
+                f"is True (got {self.hy_sparse_block_size}). The FA4 block-score "
+                "op requires 128 % block_B == 0 and the SM100 DSA block-sparse "
+                "gather requires block_B == 64 (TopK tile alignment)."
+            )
+
         if (
             self.num_nextn_predict_layers == 0
             and self.window_attn_skip_freq is not None
