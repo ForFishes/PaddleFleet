@@ -184,6 +184,17 @@ class TestBuildHySparseValidRange(unittest.TestCase):
                 f"!= len {dee - ds}",
             )
 
+    def test_bidirectional_bound_mask_rejected(self):
+        # A document mask must carry a single exclusive-doc-end bound on the
+        # last axis. A 2-bound (start+end / bidirectional) layout would make
+        # [:, 0, :, 0] no longer the doc-end, so it must be rejected loudly.
+        doc_lens = [40, 88, 27]
+        mask = _flashmask_from_doc_lens(doc_lens)  # [1, 1, S, 1]
+        s = sum(doc_lens)
+        two_bound = paddle.concat([mask, mask], axis=-1)  # [1, 1, S, 2]
+        with self.assertRaises(ValueError):
+            build_hysparse_valid_range(two_bound, s, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

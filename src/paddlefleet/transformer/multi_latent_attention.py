@@ -111,6 +111,19 @@ def build_hysparse_valid_range(
                 f"{attn_mask_startend_row_indices.shape} "
                 "(layout changed? [:, 0, :, 0] would no longer be the doc-end)"
             )
+        # A legal document mask carries a single exclusive-doc-end bound on the
+        # last axis: the per-token exclusive doc-end read via [:, 0, :, 0].
+        # shape[3] > 1 (e.g. bidirectional start+end bounds) would make bound 0
+        # mean something other than the doc-end and mis-bucket every bos ->
+        # block; reject it here. (Axis 1 may be > 1: a multi-head flashmask
+        # whose heads share one doc layout is valid and read via head 0.)
+        if attn_mask_startend_row_indices.shape[3] != 1:
+            raise ValueError(
+                "attn_mask_startend_row_indices must be a document mask with a "
+                "single exclusive-doc-end bound (shape[3] == 1); got shape="
+                f"{attn_mask_startend_row_indices.shape} "
+                "([:, 0, :, 0] would no longer be the doc-end)"
+            )
         # [B, *, S, *] -> [B_mask, S] exclusive document end per token.
         de = attn_mask_startend_row_indices[:, 0, :, 0].cast("int64")  # [Bm, S]
         # The flashmask row indices may carry a batch of 1 that broadcasts over
