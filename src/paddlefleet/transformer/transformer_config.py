@@ -1143,6 +1143,35 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.use_dense_mtp, (
                 "mtp_shared_last_layer cannot be True if use_dense_mtp= True"
             )
+            # For DSv4 hybrid attention the per-layer csa_compress_ratio decides
+            # both the parameter set (compressor / indexer presence) and the
+            # attention semantics (full-causal MQA / window / compressed). The
+            # MTP layer reads csa_compress_ratios[num_hidden_layers + mtp_local]
+            # (see dsv4_hybrid_attention.py), i.e. the *last* entry, while the
+            # backbone-last layer reads the second-to-last one. If the two
+            # differ and the MTP layer's parameter set happens to be a subset of
+            # the backbone's, paddle's _alias_shared_layer silently aliases them
+            # and the shared weights get used under two different attention
+            # algorithms. Warn rather than assert: the mismatch is only unsafe,
+            # not always wrong, and the incompatible direction (MTP layer needs
+            # parameters the backbone layer lacks) already raises in
+            # _alias_shared_layer.
+            if (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and self.csa_compress_ratios is not None
+                and len(self.csa_compress_ratios) >= 2
+                and self.csa_compress_ratios[-1] != self.csa_compress_ratios[-2]
+            ):
+                logger.warning(
+                    "mtp_shared_last_layer=True but csa_compress_ratios[-1]="
+                    f"{self.csa_compress_ratios[-1]} != [-2]="
+                    f"{self.csa_compress_ratios[-2]}: the MTP layer and the "
+                    "backbone last layer share weights but will run different "
+                    "attention semantics. If the MTP layer's parameter set is "
+                    "a subset of the backbone's this aliases silently; "
+                    "otherwise _alias_shared_layer raises a param/shape "
+                    "mismatch."
+                )
 
         if self.enable_mtp_magic_send:
             assert not getattr(self, "tie_word_embeddings", False), (
@@ -1375,10 +1404,18 @@ class TransformerConfig(ModelParallelConfig):
                     f"must equal num_hidden_layers ({self.num_hidden_layers + mtp_num_layers})."
                 )
             for i, r in enumerate(self.csa_compress_ratios):
-                if not (isinstance(r, int) and (r == 0 or 2 <= r <= 128)):
+                # Accept python int and numpy integer scalars (a ratios list
+                # loaded from npy/np.load yields np.int64, which would otherwise
+                # be rejected); reject bool / np.bool_ so True does not sneak
+                # through as 1, and reject floats.
+                is_integral = hasattr(r, "__index__") and type(
+                    r
+                ).__name__ not in ("bool", "bool_")
+                if not (is_integral and (r == -1 or r == 0 or 2 <= r <= 128)):
                     raise ValueError(
                         f"csa_compress_ratios[{i}]={r} is invalid. "
-                        f"Each value must be 0 (window), an integer in [2, 127] "
+                        f"Each value must be -1 (full-causal MQA), 0 (window), "
+                        f"an integer in [2, 127] "
                         f"(CSA, overlap + Lightning Indexer), or 128 (HCA)."
                     )
 
