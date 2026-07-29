@@ -31,6 +31,7 @@ def unfused_compressed_sparse_attn(
     attn_sink: Tensor,
     topk_indices: Tensor,
     softmax_scale: float,
+    topk_length: Tensor | None = None,
 ) -> Tensor:
     """Sparse attention with MQA and learnable attention sink.
 
@@ -40,6 +41,8 @@ def unfused_compressed_sparse_attn(
         attn_sink: [np] per-head learnable bias (attention sink)
         topk_indices: [b, sq, topk] indices into kv_full dim=1 (-1 = invalid)
         softmax_scale: attention scale factor
+        topk_length: optional [b, sq] int32 valid prefix length; slots at
+            ``>= topk_length[b, i]`` are ignored for query row ``i``.
 
     Returns:
         output: [b, sq, np * hn]
@@ -69,7 +72,13 @@ def unfused_compressed_sparse_attn(
             paddle.einsum("bnsh,bskh->bnsk", q, kv_g) * softmax_scale
         )  # [b, np, sq, topk]
         # Mask invalid positions (topk_indices < 0) with -inf
-        invalid_mask = (topk_indices < 0).unsqueeze(1)  # [b, 1, sq, topk]
+        invalid = topk_indices < 0  # [b, sq, topk]
+        if topk_length is not None:
+            slots = paddle.arange(topk, dtype="int32").reshape([1, 1, topk])
+            invalid = invalid | (
+                slots >= topk_length.reshape([b, sq, 1]).cast("int32")
+            )
+        invalid_mask = invalid.unsqueeze(1)  # [b, 1, sq, topk]
         scores = scores.masked_fill(invalid_mask, float("-inf"))
 
         # Softmax with attention sink
@@ -99,7 +108,14 @@ def unfused_compressed_sparse_attn(
 class CSASparseAttention(paddle.autograd.PyLayer):
     @staticmethod
     def forward(
-        ctx, query, kv_full, attn_sink, topk_idxs, softmax_scale, backend
+        ctx,
+        query,
+        kv_full,
+        attn_sink,
+        topk_idxs,
+        softmax_scale,
+        backend,
+        topk_length=None,
     ):
         from paddlefleet.fusions.csa_sparse_attn_utils import prepare_inputs
 
@@ -108,6 +124,11 @@ class CSASparseAttention(paddle.autograd.PyLayer):
         ctx.softmax_scale = float(softmax_scale)
         ctx.attn_sink_dtype = attn_sink.dtype
         ctx.backend = backend
+        # ``topk_length`` is an int32 index tensor without gradient; keep it on
+        # ctx (not in save_for_backward) so the saved-tensor tuple layout stays
+        # unchanged for the CSA/HCA paths.
+        ctx.topk_length = topk_length
+        ctx.has_topk_length = topk_length is not None
 
         query, kv_full, attn_sink, topk_idxs = prepare_inputs(
             query,
@@ -126,8 +147,14 @@ class CSASparseAttention(paddle.autograd.PyLayer):
                 attn_sink,
                 topk_idxs,
                 sm_scale=ctx.softmax_scale,
+                topk_length=topk_length,
             )
         else:
+            if topk_length is not None:
+                raise NotImplementedError(
+                    "topk_length is only supported by the 'cudnn' and "
+                    f"'unfused' backends, got backend={backend!r}."
+                )
             from paddlefleet.tilelang_ops.attn.sparse_mqa import sparse_attn
 
             output, lse = sparse_attn(
@@ -169,8 +196,32 @@ class CSASparseAttention(paddle.autograd.PyLayer):
                 attn_sink,
                 topk_idxs_flat,
                 softmax_scale=ctx.softmax_scale,
+                topk_length=None
+                if ctx.topk_length is None
+                else ctx.topk_length.reshape([b * sq]).cast("int32"),
             )
             dq = dq_flat.reshape(query.shape)
+            if ctx.topk_length is not None:
+                # The cuDNN sparse backward leaves dq uninitialised (reads dirty
+                # device memory -> NaN) for query rows whose valid prefix holds
+                # no valid key at all. Packed sequences hit this on padding
+                # rows, which attend to the sink only. Their forward output is
+                # identically zero regardless of q, so the analytic dq is
+                # exactly zero and clearing it is the correct value, not a
+                # workaround. Only reachable on the topk_length path.
+                slots = paddle.arange(topk_idxs.shape[-1], dtype="int32")
+                row_has_key = (
+                    (topk_idxs >= 0)
+                    & (
+                        slots.reshape([1, 1, -1])
+                        < ctx.topk_length.reshape([b, sq, 1]).cast("int32")
+                    )
+                ).any(axis=-1)
+                dq = paddle.where(
+                    row_has_key.reshape([b, sq, 1, 1]),
+                    dq,
+                    paddle.zeros_like(dq),
+                )
             dkv = dkv_flat.reshape(kv_full.shape)
             d_attn_sink = d_sink.reshape(attn_sink.shape).cast(
                 ctx.attn_sink_dtype
@@ -195,16 +246,31 @@ class CSASparseAttention(paddle.autograd.PyLayer):
                 ctx.attn_sink_dtype
             )
 
-        return (dq, dkv, d_attn_sink, None)
+        grads = (dq, dkv, d_attn_sink, None)
+        if ctx.has_topk_length:
+            # ``topk_length`` was passed as an extra (non-differentiable) tensor
+            # input, so an extra placeholder gradient is required.
+            grads = (*grads, None)
+        return grads
 
 
 def csa_sparse_attn(
-    query, kv_full, attn_sink, topk_idxs, softmax_scale, backend="tilelang"
+    query,
+    kv_full,
+    attn_sink,
+    topk_idxs,
+    softmax_scale,
+    backend="tilelang",
+    topk_length=None,
 ):
     """Unified CSA sparse attention entry point.
 
     Args:
         backend: one of {"unfused", "tilelang", "cudnn"}.
+        topk_length: optional ``[b, sq]`` int32 valid prefix length per query
+            row. Only the "cudnn" and "unfused" backends support it; it lets
+            the kernel stop early instead of walking all ``topk`` slots, which
+            is what makes the full-causal MQA layers affordable.
     """
     if backend == "unfused":
         return unfused_compressed_sparse_attn(
@@ -213,6 +279,7 @@ def csa_sparse_attn(
             attn_sink,
             topk_idxs,
             softmax_scale,
+            topk_length=topk_length,
         )
     if backend not in ("tilelang", "cudnn"):
         raise ValueError(
@@ -226,4 +293,5 @@ def csa_sparse_attn(
         topk_idxs,
         softmax_scale,
         backend,
+        topk_length,
     )
