@@ -1976,7 +1976,7 @@ def flashmask_attention_cp(
             mode,
             window_size,
         )
-    elif mode == "dualchunk_allgather":
+    elif mode in ("dualchunk_allgather", "contiguous_allgather"):
         output = FlashMaskContextParallel.apply(
             query,
             key,
