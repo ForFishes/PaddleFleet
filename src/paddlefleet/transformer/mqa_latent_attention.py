@@ -14,7 +14,7 @@
 
 """Non-absorbed MQA core attention for hybrid MLA layers, with DSA.
 
-``un_absorbed_mqa`` selects which core attention the
+``non_absorbed_mqa`` selects which core attention the
 ``csa_compress_ratios == -2`` (MLA) layers of a ``dsv4_hybrid`` model run:
 
 * ``false`` -- unchanged dense MLA (MHA); this module is not used.
@@ -87,7 +87,7 @@ class MQALatentAttentionSublayersSpec:
     """Sublayers spec for :class:`MQALatentAttention`.
 
     Args:
-        indexer: ``DSAIndexer`` spec. ``un_absorbed_mqa`` always provides one;
+        indexer: ``DSAIndexer`` spec. ``non_absorbed_mqa`` always provides one;
             ``None`` (dense per-document causal attention, mathematically equal
             to MHA) exists only for the absorption equivalence unit tests.
     """
@@ -205,16 +205,16 @@ class MQALatentAttention(FleetLayer):
         """
         if packed_seq_params is not None:
             raise NotImplementedError(
-                "un_absorbed_mqa=True does not support packed_seq_params; "
+                "non_absorbed_mqa=True does not support packed_seq_params; "
                 "document masking is driven by "
                 "attn_mask_startend_row_indices."
             )
         if get_context_parallel_world_size() > 1:
             raise NotImplementedError(
-                "un_absorbed_mqa=True does not support context parallel yet: "
+                "non_absorbed_mqa=True does not support context parallel yet: "
                 "the document metadata below is derived in local token space, "
                 "while a CP rank only holds a query slice of the globally "
-                "all-gathered KV. Keep un_absorbed_mqa=false for CP runs (the "
+                "all-gathered KV. Keep non_absorbed_mqa=false for CP runs (the "
                 "dense MHA path supports contiguous_allgather)."
             )
         if v_b_proj_weight is None:
@@ -226,7 +226,7 @@ class MQALatentAttention(FleetLayer):
         b, s = int(query.shape[0]), int(query.shape[1])
         if b != 1:
             raise NotImplementedError(
-                "un_absorbed_mqa=True requires micro batch size 1 (documents "
+                "non_absorbed_mqa=True requires micro batch size 1 (documents "
                 f"are packed along the sequence), got b={b}."
             )
         kv = key.squeeze(2).contiguous()  # [b, s, kv_lora + qk_rope]

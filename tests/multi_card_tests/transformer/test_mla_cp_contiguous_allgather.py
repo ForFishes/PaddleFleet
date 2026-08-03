@@ -155,7 +155,7 @@ def build_cfg(cp_size, sink=False, attn_mode="mha"):
     c.experimental_attention_variant = "dsv4_hybrid"
     # ``attn_mode`` is a fixture label: "mha" -> dense DotProductAttention,
     # "mqa"/"mqa_dsa" -> runtime-absorbed MQALatentAttention.
-    c.un_absorbed_mqa = attn_mode != "mha"
+    c.non_absorbed_mqa = attn_mode != "mha"
     c.hybrid_mla_q_lora_rank = 64
     c.hybrid_mla_kv_lora_rank = 128
     c.hybrid_mla_qk_nope_head_dim = 64
@@ -291,7 +291,6 @@ def run_mla_cp(mask_full, seed=2026, sink=False):
         "dH": _rel(hb.grad, ha.grad[:, s:e]),
         "param_err": param_err,
         "per_pos": per_pos,
-        "slice": (s, e),
         "ref_gnorm": ref_sq**0.5,
         "cp_gnorm": cp_sq**0.5,
     }
@@ -301,14 +300,6 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
     # ---- Item 2: single-doc CP=2 vs CP=1 output + every param grad ----
     def test_2_single_doc_equivalence(self):
         r = run_mla_cp(_row_end([128], 128))
-        if CP_RANK == 0:
-            print(
-                "\n[ITEM2] fwd_rel={:.3e} dH_rel={:.3e}".format(
-                    r["fwd"], r["dH"]
-                )
-            )
-            for n, v in sorted(r["param_err"].items()):
-                print(f"[ITEM2] grad {n:<26} rel={v:.3e}")
         self.assertLess(r["fwd"], FWD_RTOL, "forward exceeds bf16 tol")
         self.assertLess(r["dH"], GRAD_RTOL, "dH exceeds bf16 tol")
         for n, v in r["param_err"].items():
@@ -319,12 +310,6 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
     def test_3_boundary_doc_spanning_rank_boundary(self):
         # doc0 = [0,96) spans the rank boundary at 64; doc1 = [96,128) inside r1.
         r = run_mla_cp(_row_end([96, 32], 128))
-        if CP_RANK == 0:
-            print(
-                "\n[ITEM3-span] fwd_rel={:.3e} max_per_pos={:.3e}".format(
-                    r["fwd"], max(r["per_pos"])
-                )
-            )
         self.assertLess(r["fwd"], FWD_RTOL)
         self.assertLess(max(r["per_pos"]), 5e-2)
 
@@ -332,23 +317,11 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
         # doc0 = [0,64) == rank0 exactly; doc1 = [64,128) entirely inside rank1.
         # Position 64 is the first query of rank1 AND first token of doc1.
         r = run_mla_cp(_row_end([64, 64], 128))
-        if CP_RANK == 0:
-            print(
-                "\n[ITEM3-inside] fwd_rel={:.3e} max_per_pos={:.3e} first_q={:.3e}".format(
-                    r["fwd"], max(r["per_pos"]), r["per_pos"][0]
-                )
-            )
         self.assertLess(r["fwd"], FWD_RTOL)
         self.assertLess(max(r["per_pos"]), 5e-2)
 
     def test_3_boundary_many_docs(self):
         r = run_mla_cp(_row_end([16, 48, 40, 24], 128))
-        if CP_RANK == 0:
-            print(
-                "\n[ITEM3-many] fwd_rel={:.3e} max_per_pos={:.3e}".format(
-                    r["fwd"], max(r["per_pos"])
-                )
-            )
         self.assertLess(r["fwd"], FWD_RTOL)
         self.assertLess(max(r["per_pos"]), 5e-2)
 
@@ -359,17 +332,9 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
         ]
         raised = None
         try:
-            r = run_mla_cp(_row_end([128], 128), sink=True)
+            run_mla_cp(_row_end([128], 128), sink=True)
         except (RuntimeError, NotImplementedError) as ex:
             raised = str(ex)
-        if CP_RANK == 0:
-            print(
-                f"\n[ITEM4] FLAGS_flash_attn_version={flag} raised={raised!r}"
-            )
-            if raised is None:
-                print(
-                    "[ITEM4] sink+CP SUCCEEDED fwd_rel={:.3e}".format(r["fwd"])
-                )
         if int(flag) not in (3, 4):
             # mha sink on FA!=4 must NOT silently drop the sink: the layer
             # raises a clear construction-time guard (RuntimeError) instead.
@@ -390,19 +355,10 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
         ]
         paddle.set_flags({"FLAGS_flash_attn_version": 4})
         try:
-            # Compare CP+sink against BOTH the sink and the sinkless reference:
-            # a silent drop would match the sinkless ref, not the sink ref.
+            # CP+sink must match the CP=1 sink reference elementwise.
             r_sink = run_mla_cp(_row_end([128], 128), sink=True)
-            r_nosink = run_mla_cp(_row_end([128], 128), sink=False)
         finally:
             paddle.set_flags({"FLAGS_flash_attn_version": old})
-        if CP_RANK == 0:
-            print(
-                "\n[ITEM5] FA4 sink+CP fwd_rel={:.3e} (vs sink ref); "
-                "sinkless fwd_rel={:.3e}".format(r_sink["fwd"], r_nosink["fwd"])
-            )
-            for n, v in sorted(r_sink["param_err"].items()):
-                print(f"[ITEM5] grad {n:<26} rel={v:.3e}")
         self.assertLess(
             r_sink["fwd"],
             FWD_RTOL,
@@ -415,12 +371,6 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
     def test_7_grad_norm_ratio(self):
         r = run_mla_cp(_row_end([128], 128))
         ratio = r["cp_gnorm"] / (r["ref_gnorm"] + 1e-12)
-        if CP_RANK == 0:
-            print(
-                "\n[ITEM7] ref_gnorm={:.6e} cp_gnorm={:.6e} ratio={:.6f}".format(
-                    r["ref_gnorm"], r["cp_gnorm"], ratio
-                )
-            )
         # A loss-scaling / averaging bug would show a ratio of ~CP_SIZE or
         # ~1/CP_SIZE. Correct behaviour is ratio ~= 1.
         self.assertAlmostEqual(
@@ -451,8 +401,6 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
             )
         except Exception as ex:
             # Construction-time rejection is also acceptable early failure.
-            if CP_RANK == 0:
-                print(f"\n[ITEM6] MQA rejected at construction: {ex!r}")
             self.assertIsInstance(
                 ex, (NotImplementedError, ValueError, AssertionError)
             )
@@ -472,8 +420,6 @@ class TestMLAContiguousAllgatherCP(unittest.TestCase):
                 attn_mask_startend_row_indices=row_end,
                 v_b_proj_weight=paddle.randn([kv_lora, h, v_head], dtype=DTYPE),
             )
-        if CP_RANK == 0:
-            print(f"\n[ITEM6] MQA CP raised at forward: {cm.exception!s}")
         self.assertIn("context", str(cm.exception).lower())
 
 

@@ -457,22 +457,22 @@ class MultiLatentAttention(Attention):
         # activations change -- so an MHA checkpoint loads into an MQA run.
         self.mqa_latent = getattr(
             config, "experimental_attention_variant", None
-        ) == "dsv4_hybrid" and getattr(config, "un_absorbed_mqa", False)
+        ) == "dsv4_hybrid" and getattr(config, "non_absorbed_mqa", False)
         if self.mqa_latent:
             if self.config.apply_rope_fusion:
                 raise ValueError(
-                    "un_absorbed_mqa=True does not support apply_rope_fusion: "
+                    "non_absorbed_mqa=True does not support apply_rope_fusion: "
                     "the fused kernel writes the per-head K/V that absorption "
                     "skips."
                 )
             if self.config.sequence_parallel:
                 raise ValueError(
-                    "un_absorbed_mqa=True does not support sequence_parallel "
+                    "non_absorbed_mqa=True does not support sequence_parallel "
                     "yet."
                 )
             if get_pg_size(self.pg_collection.tp) != 1:
                 raise ValueError(
-                    "un_absorbed_mqa=True does not support tensor parallel "
+                    "non_absorbed_mqa=True does not support tensor parallel "
                     "(kv_b_proj is absorbed locally)."
                 )
 
@@ -540,7 +540,7 @@ class MultiLatentAttention(Attention):
         # with no hint about the cause, so fail at construction time. We
         # deliberately do NOT set the flag ourselves: it is process-global and
         # would switch every other (HCA / CSA) layer's kernel too.
-        # ``un_absorbed_mqa`` needs neither check -- its block-sparse kernel
+        # ``non_absorbed_mqa`` needs neither check -- its block-sparse kernel
         # supports the sink natively and up-casts it internally. Neither do the
         # HySparse absorbed-MQA layers: ``gpt_layer_specs.py:318`` builds every
         # MLA layer as ``MQASelfAttention`` when ``enable_hy_sparse_attention``
@@ -572,7 +572,7 @@ class MultiLatentAttention(Attention):
                     "that path). Either export FLAGS_flash_attn_version=4 "
                     "(NOTE: process-global -- it changes the HCA/CSA layers' "
                     "kernel as well), or run the hybrid MLA layers with "
-                    "un_absorbed_mqa=true, whose block-sparse kernel supports "
+                    "non_absorbed_mqa=true, whose block-sparse kernel supports "
                     "the sink natively."
                 )
             if "bfloat16" not in str(self.config.params_dtype):

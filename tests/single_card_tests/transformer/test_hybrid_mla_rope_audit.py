@@ -93,23 +93,6 @@ def ref_rope_halfsplit(x: np.ndarray, pos: int, base: float) -> np.ndarray:
     return out
 
 
-def ref_rope_interleaved(x: np.ndarray, pos: int, base: float) -> np.ndarray:
-    """GPT-J interleaved layout: pair (2j, 2j+1).
-
-    out[2j]   = x[2j]   * cos - x[2j+1] * sin
-    out[2j+1] = x[2j+1] * cos + x[2j]   * sin
-    """
-    d = x.shape[-1]
-    ang = ref_angles(np.array([pos]), d, base)[0]  # [d/2]
-    cos, sin = np.cos(ang), np.sin(ang)
-    a = x[..., 0::2]
-    b = x[..., 1::2]
-    out = np.empty_like(x, dtype=np.float64)
-    out[..., 0::2] = a * cos - b * sin
-    out[..., 1::2] = b * cos + a * sin
-    return out
-
-
 def ref_rope_mla(x: np.ndarray, pos: int, base: float) -> np.ndarray:
     """DeepSeek-MLA layout used by ``multi_latent_attention=True``.
 
@@ -152,6 +135,23 @@ def _apply_real(x_np, emb, config):
     return np.asarray(out.astype("float32").numpy(), dtype=np.float64)
 
 
+def _rope(
+    dim=QK_ROPE_HEAD_DIM, rotary_base=ROPE_THETA, interleaved=False, **kw
+):
+    """RotaryEmbedding with the audit's shared defaults (rotary_percent=1.0).
+
+    Distinct cases override via kwargs: ``rotary_base=`` (HCA 160000 schedule),
+    ``rope_scaling=False`` (no-YaRN-leak), ``interleaved=True`` (interleaved).
+    """
+    return RotaryEmbedding(
+        dim,
+        rotary_percent=1.0,
+        rotary_interleaved=interleaved,
+        rotary_base=rotary_base,
+        **kw,
+    )
+
+
 TOL = 2e-5  # fp32 round-trip tolerance for the rope primitives
 
 
@@ -161,12 +161,7 @@ TOL = 2e-5  # fp32 round-trip tolerance for the rope primitives
 class TestFrequencyScheduleAndLayout(unittest.TestCase):
     def test_inv_freq_matches_reference(self):
         """RotaryEmbedding inv_freq == 1/theta^(2i/dim), theta=10000, dim=64."""
-        r = RotaryEmbedding(
-            QK_ROPE_HEAD_DIM,
-            rotary_percent=1.0,
-            rotary_interleaved=False,
-            rotary_base=ROPE_THETA,
-        )
+        r = _rope()
         got = np.asarray(r.inv_freq.astype("float64").numpy())
         ref = ref_inv_freq(QK_ROPE_HEAD_DIM, ROPE_THETA)
         self.assertEqual(got.shape, (QK_ROPE_HEAD_DIM // 2,))
@@ -175,9 +170,7 @@ class TestFrequencyScheduleAndLayout(unittest.TestCase):
 
     def test_rotary_percent_one_uses_full_dim(self):
         """rotary_percent=1.0 -> all 64 dims rotated (rot_dim == head_dim)."""
-        r = RotaryEmbedding(
-            QK_ROPE_HEAD_DIM, rotary_percent=1.0, rotary_base=ROPE_THETA
-        )
+        r = _rope()
         emb = r(8)
         self.assertEqual(emb.shape[-1], QK_ROPE_HEAD_DIM)
 
@@ -189,12 +182,7 @@ class TestFrequencyScheduleAndLayout(unittest.TestCase):
         A plain RotaryEmbedding built with base=theta must equal the reference
         with NO scaling applied.
         """
-        r = RotaryEmbedding(
-            QK_ROPE_HEAD_DIM,
-            rotary_percent=1.0,
-            rotary_base=ROPE_THETA,
-            rope_scaling=False,  # -2 layers: rope_scaling null
-        )
+        r = _rope(rope_scaling=False)  # -2 layers: rope_scaling null
         got = np.asarray(r.inv_freq.astype("float64").numpy())
         ref_plain = ref_inv_freq(QK_ROPE_HEAD_DIM, ROPE_THETA)
         # A YaRN/llama-scaled inv_freq would divide low freqs by 16 -> would
@@ -217,7 +205,7 @@ class TestFrequencyScheduleAndLayout(unittest.TestCase):
         rng = np.random.default_rng(0)
         S, D = 6, QK_ROPE_HEAD_DIM
         x = rng.standard_normal((1, S, 1, D))
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         emb = r(S)
         cfg = _fake_mla_config(multi_latent_attention=True)
         got = _apply_real(x, emb, cfg)
@@ -242,7 +230,7 @@ class TestFrequencyScheduleAndLayout(unittest.TestCase):
         rng = np.random.default_rng(1)
         S, D = 5, QK_ROPE_HEAD_DIM
         x = rng.standard_normal((1, S, 1, D))
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         emb = r(S)
         cfg = _fake_mla_config(multi_latent_attention=False)
         got = _apply_real(x, emb, cfg)
@@ -260,7 +248,7 @@ class TestRelativeOffsetInvariance(unittest.TestCase):
         """Rotate q at pos i and k at pos j via the SHIPPED apply, dot them."""
         D = q_raw.shape[-1]
         maxpos = max(i, j) + 1
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         emb = r(maxpos)
         # place q at position i, k at position j inside a length-maxpos seq
         qx = np.zeros((1, maxpos, 1, D))
@@ -277,7 +265,7 @@ class TestRelativeOffsetInvariance(unittest.TestCase):
         D = QK_ROPE_HEAD_DIM
         v = rng.standard_normal(D)
         cfg = _fake_mla_config(True)
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         emb = r(10)
         vx = np.zeros((1, 10, 1, D))
         vx[0, 7, 0] = v
@@ -338,7 +326,7 @@ class TestThreeModeRopeAgreement(unittest.TestCase):
         S, D = 8, QK_ROPE_HEAD_DIM
         q_pe = rng.standard_normal((1, S, 4, D))  # 4 heads
         k_pe = rng.standard_normal((1, S, 1, D))
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         emb = r(S)
         cfg = _fake_mla_config(True)
         # "mha", "mqa", "mqa_dsa" all execute exactly this call:
@@ -432,7 +420,7 @@ class TestPackedMultiDocPositions(unittest.TestCase):
     def test_training_uses_global_arange_positions(self):
         """position_ids=None -> global arange freqs, no per-doc reset."""
         D = QK_ROPE_HEAD_DIM
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         freqs = r.get_freqs_non_repeated(6, position_ids=None)
         got = np.asarray(freqs.astype("float64").numpy())
         ref = ref_angles(np.arange(6), D, ROPE_THETA)
@@ -454,7 +442,7 @@ class TestPackedMultiDocPositions(unittest.TestCase):
 
         def score(i, j):
             m = max(i, j) + 1
-            r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+            r = _rope()
             emb = r(m)
             qx = np.zeros((1, m, 1, D))
             kx = np.zeros((1, m, 1, D))
@@ -504,7 +492,7 @@ class TestCPContiguousAllgatherOffset(unittest.TestCase):
         S_global = nranks * L
         cfg = _fake_mla_config(True)
 
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         emb_full = r(S_global)  # global positions 0..S_global-1
         emb_rank1 = self._contiguous_slice(emb_full, rank, nranks)  # [1,L,1,D]
 
@@ -544,7 +532,7 @@ class TestCPContiguousAllgatherOffset(unittest.TestCase):
         D = QK_ROPE_HEAD_DIM
         L = 8
         cfg = _fake_mla_config(True)
-        r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+        r = _rope()
         emb_full = r(2 * L)
         emb_r1 = self._contiguous_slice(emb_full, 1, 2)
         emb_r0 = self._contiguous_slice(emb_full, 0, 2)
@@ -580,7 +568,7 @@ class TestMTPShift(unittest.TestCase):
 
         def score(i, j):
             m = max(i, j) + 1
-            r = RotaryEmbedding(D, rotary_percent=1.0, rotary_base=ROPE_THETA)
+            r = _rope()
             emb = r(m)
             qx = np.zeros((1, m, 1, D))
             kx = np.zeros((1, m, 1, D))
@@ -615,11 +603,7 @@ class TestCompressRotaryBaseSeparation(unittest.TestCase):
     """
 
     def test_hca_base_160000_matches_reference(self):
-        r = RotaryEmbedding(
-            QK_ROPE_HEAD_DIM,
-            rotary_percent=1.0,
-            rotary_base=CSA_COMPRESS_ROTARY_BASE,
-        )
+        r = _rope(rotary_base=CSA_COMPRESS_ROTARY_BASE)
         got = np.asarray(r.inv_freq.astype("float64").numpy())
         ref = ref_inv_freq(QK_ROPE_HEAD_DIM, CSA_COMPRESS_ROTARY_BASE)
         self.assertLess(np.max(np.abs(got - ref)), 1e-6)

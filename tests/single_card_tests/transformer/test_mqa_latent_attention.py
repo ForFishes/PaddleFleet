@@ -14,13 +14,13 @@
 
 """Unit tests for :mod:`paddlefleet.transformer.mqa_latent_attention`.
 
-``un_absorbed_mqa=True`` turns the hybrid MLA (``csa_compress_ratios == -2``)
+``non_absorbed_mqa=True`` turns the hybrid MLA (``csa_compress_ratios == -2``)
 layers of a ``dsv4_hybrid`` model into :class:`MQALatentAttention`. The module
 picks its path from the sublayers spec, not from any config string:
 
 * ``MQALatentAttentionSublayersSpec(indexer=None)`` -- per-document full-causal
   dense attention on the latent, mathematically equal to MHA. In production the
-  indexer is always built (``gpt_layer_specs`` when ``un_absorbed_mqa`` is set),
+  indexer is always built (``gpt_layer_specs`` when ``non_absorbed_mqa`` is set),
   so this indexer-less path exists only for the absorption-equivalence tests
   here, driven by constructing the layer directly with ``indexer=None``.
 * an indexer spec -- forced local window + Lightning-indexer top-k, i.e. DSA on
@@ -49,88 +49,36 @@ import unittest
 
 import numpy as np
 import paddle
-import paddle.nn.functional as F
-from paddle.distributed.fleet.meta_parallel import LayerSpec
 
 from paddlefleet.transformer.csa_attention import (
     _build_window_topk_idxs_from_doc_bounds,
     _derive_csa_doc_boundaries,
 )
-from paddlefleet.transformer.dsa_attention import (
-    DSAIndexer,
-    DSAIndexerLossLoggingHelper,
-    DSAIndexerSublayersSpec,
-)
-from paddlefleet.transformer.enums import AttnMaskType
-from paddlefleet.transformer.mqa_latent_attention import (
-    MQALatentAttention,
-    MQALatentAttentionSublayersSpec,
-)
+from paddlefleet.transformer.dsa_attention import DSAIndexerLossLoggingHelper
 from paddlefleet.transformer.transformer_config import TransformerConfig
-from paddlefleet.utils import init_method_normal, scaled_init_method_normal
 
-
-# ---------------------------------------------------------------------------
-# Stub layers (same pattern as test_dsa_attention.py)
-# ---------------------------------------------------------------------------
-class BiasedLinear(paddle.nn.Layer):
-    def __init__(self, in_features, out_features, **kwargs):
-        super().__init__()
-        self.linear = paddle.nn.Linear(in_features, out_features)
-
-    def forward(self, x):
-        if x.dtype != self.linear.weight.dtype:
-            x = x.cast(self.linear.weight.dtype)
-        return self.linear(x), self.linear.bias
-
-
-class LayerNormStub(paddle.nn.Layer):
-    """LayerNorm stub accepting either ``hidden_size``/``eps`` naming."""
-
-    def __init__(
-        self,
-        hidden_size=None,
-        eps=None,
-        normalized_shape=None,
-        epsilon=None,
-        **kwargs,
-    ):
-        super().__init__()
-        size = hidden_size if hidden_size is not None else normalized_shape
-        self.eps = (
-            eps
-            if eps is not None
-            else (epsilon if epsilon is not None else 1e-5)
-        )
-        self.weight = paddle.nn.Parameter(paddle.ones([size]))
-        self.bias = paddle.nn.Parameter(paddle.zeros([size]))
-
-    def forward(self, x):
-        mean = x.mean(axis=-1, keepdim=True)
-        var = x.var(axis=-1, keepdim=True, unbiased=False)
-        x = (x - mean) / paddle.sqrt(var + self.eps)
-        return x * self.weight + self.bias
-
-
-# ---------------------------------------------------------------------------
-# Geometry. DK/DV are hard requirements of the FlashMLA sparse kernel
-# (d_qk in {512, 576}, d_v == 512). K_CHANNELS is the *MHA* q_head_dim
-# (qk_nope 192 + qk_rope 64): absorption preserves scores exactly, so the MHA
-# softmax scale must be kept instead of the 576-wide latent one.
-# INDEX_TOPK must stay a multiple of 128 (``indexer_backward_sm100`` asserts
-# ``topk % block_I == 0``) and INDEX_HEADS >= 64 (``assert heads >= 64``).
-# ---------------------------------------------------------------------------
-H = 8
-DK = 576
-DV = 512
-V_HEAD_DIM = 64
-K_CHANNELS = 256
-WINDOW = 128
-INDEX_TOPK = 128
-INDEX_HEADS = 64
-INDEX_HEAD_DIM = 128
-HIDDEN = 256
-Q_LORA = 128
+from .hybrid_mla_utils import (
+    _CAPTURED,
+    _GPU,
+    DK,
+    DV,
+    HIDDEN,
+    INDEX_HEAD_DIM,
+    INDEX_HEADS,
+    INDEX_TOPK,
+    K_CHANNELS,
+    Q_LORA,
+    V_HEAD_DIM,
+    WINDOW,
+    H,
+    _build_module,
+    _check_index_invariants,
+    _create_mqa_config,
+    _dense_reference,
+    _make_inputs,
+    _rel,
+    _row_end,
+)
 
 # Adversarial document layouts: shorter than / equal to / longer than the
 # forced window, single-token documents, and a document overrunning the buffer.
@@ -146,243 +94,6 @@ _LAYOUTS = [
     [3, WINDOW, WINDOW + 1, 1],
     [300],
 ]
-
-
-def _dsa_kernels_available():
-    if not paddle.is_compiled_with_cuda():
-        return False
-    try:
-        from paddlefleet.cudnn_ops.block_sparse_mqa_dsa import is_dsa_available
-
-        return bool(is_dsa_available())
-    except Exception:
-        return False
-
-
-_GPU = unittest.skipUnless(
-    _dsa_kernels_available(),
-    "requires SM100+ FlashMLA sparse fwd + cuDNN DSA bwd kernels",
-)
-
-
-def _create_mqa_config(mode="mqa", loss_coeff=0.0, num_hidden_layers=2):
-    """dsv4_hybrid config for a ``csa_compress_ratios == -2`` layer.
-
-    ``mode`` is a test-only convenience: both ``"mqa"`` (dense, indexer-less)
-    and ``"mqa_dsa"`` (DSA) set ``un_absorbed_mqa=True`` on the config; the
-    dense/sparse distinction is expressed by whether ``_build_module`` attaches
-    an indexer to the sublayers spec, mirroring the production source which
-    reads the layer path from the spec, not from a config string.
-
-    Attributes are assigned after construction so that ``__post_init__``
-    validation (exercised by the production model config, not by this unit) is
-    bypassed -- same convention as ``test_dsa_attention.py``.
-    """
-    config = TransformerConfig(
-        num_hidden_layers=num_hidden_layers,
-        hidden_size=HIDDEN,
-        num_attention_heads=H,
-    )
-    config.num_key_value_heads = H
-    config.head_dim = K_CHANNELS
-    config.experimental_attention_variant = "dsv4_hybrid"
-    config.un_absorbed_mqa = True
-    # Test-only marker read by ``_build_module``: production always builds the
-    # indexer when ``un_absorbed_mqa`` is set, so the indexer-less dense path is
-    # reachable only by constructing the layer directly with
-    # ``MQALatentAttentionSublayersSpec(indexer=None)``.
-    config._build_dsa_indexer = mode == "mqa_dsa"
-    config.hybrid_mla_q_lora_rank = Q_LORA
-    config.hybrid_mla_kv_lora_rank = DV
-    config.hybrid_mla_qk_nope_head_dim = 192
-    config.hybrid_mla_qk_rope_head_dim = 64
-    config.hybrid_mla_v_head_dim = V_HEAD_DIM
-    config.hybrid_mla_num_attention_heads = H
-    config.hybrid_mla_num_key_value_heads = H
-    # The indexer dims are model-wide (HF json aliases index_n_heads /
-    # index_head_dim / index_topk), shared with the CSA layers.
-    config.dsa_index_n_heads = INDEX_HEADS
-    config.dsa_index_head_dim = INDEX_HEAD_DIM
-    config.dsa_index_topk = INDEX_TOPK
-    config.csa_window_size = WINDOW
-    config.dsa_indexer_loss_coeff = loss_coeff
-    config.dsa_indexer_use_sparse_loss = True
-    config.dsa_indexer_rotary_interleaved = False
-    # The -2 layers are uncompressed, hence plain RoPE (base 10000); YaRN only
-    # applies to the compressed HCA layers.
-    config.rope_type = "rope"
-    config.rope_theta = 10000.0
-    config.rotary_interleaved = False
-    config.rotary_percent = 1.0
-    config.apply_rope_fusion = False
-    config.num_nextn_predict_layers = 0
-    config.mtp_num_layers = 0
-    config.init_method = init_method_normal(0.02)
-    config.output_layer_init_method = scaled_init_method_normal(0.02, 1, 2.0)
-    config.rms_norm_eps = 1e-5
-    config.context_parallel_size = 1
-    config.sequence_parallel = False
-    return config
-
-
-_CAPTURED = []
-
-
-class RecordingMQA(MQALatentAttention):
-    """Captures the ``token_indices`` handed to the sparse kernel."""
-
-    def _sparse_attn(self, query, kv, token_indices, sm_scale, d_v):
-        _CAPTURED.append(token_indices.numpy().copy())
-        return super()._sparse_attn(query, kv, token_indices, sm_scale, d_v)
-
-
-def _build_module(config, layer_number=1, bf16=False, sink=None):
-    indexer = None
-    if getattr(config, "_build_dsa_indexer", False):
-        indexer = LayerSpec(
-            layer=DSAIndexer,
-            sublayers_spec=DSAIndexerSublayersSpec(
-                linear_wq_b=BiasedLinear,
-                linear_wk=BiasedLinear,
-                k_norm=LayerNormStub,
-                linear_weights_proj=BiasedLinear,
-            ),
-            extra_kwargs={"is_hybrid_mla_indexer": True},
-        )
-    module = RecordingMQA(
-        config=config,
-        sublayers_spec=MQALatentAttentionSublayersSpec(indexer=indexer),
-        layer_number=layer_number,
-        attn_mask_type=AttnMaskType.causal,
-        attention_type="self",
-        k_channels=K_CHANNELS,
-    )
-    if bf16:
-        # ``rotate_activation`` asserts bf16 inputs, so the indexer projections
-        # must hold bf16 weights.
-        module.to(dtype="bfloat16")
-    if sink is not None:
-        # In production ``MQALatentAttention.__init__`` builds this parameter
-        # via the shared ``build_softmax_offset`` helper (name
-        # ``core_attention.softmax_offset``, identical to the dense
-        # ``DotProductAttention`` phase, so an MHA checkpoint stays loadable).
-        # This unit uses a default config with no sink configured, so the
-        # helper returns ``None``; inject the sink here instead. Created *after*
-        # ``to(dtype=...)`` and in the module dtype: production uses
-        # ``params_dtype`` (bf16), which is what the FA4 cute kernel of the
-        # dense path requires, and the DSA path returns the sink gradient in the
-        # parameter's own dtype.
-        module.softmax_offset = module.create_parameter(
-            shape=[H],
-            dtype="bfloat16" if bf16 else "float32",
-            default_initializer=paddle.nn.initializer.Assign(
-                np.asarray(sink, dtype="float32")
-            ),
-        )
-    return module
-
-
-def _row_end(doc_lens, seqlen):
-    """``[1, 1, s, 1]`` int32 exclusive per-token document end row."""
-    out = np.empty([seqlen], dtype="int32")
-    pos = 0
-    for length in doc_lens:
-        end = pos + length
-        out[pos : min(end, seqlen)] = end
-        pos = end
-        if pos >= seqlen:
-            break
-    if pos < seqlen:
-        out[pos:] = seqlen
-    return paddle.to_tensor(out).reshape([1, 1, seqlen, 1])
-
-
-def _doc_meta(row_end, seqlen):
-    doc_start, _, is_valid, _, _ = _derive_csa_doc_boundaries(row_end, seqlen)
-    return doc_start.numpy(), is_valid.numpy()
-
-
-def _make_inputs(seqlen, seed=0):
-    paddle.seed(seed)
-    query = (paddle.randn([1, seqlen, H, DK]) * 0.5).cast("bfloat16")
-    key = (paddle.randn([1, seqlen, 1, DK]) * 0.5).cast("bfloat16")
-    w_v = (paddle.randn([DV, H, V_HEAD_DIM]) * 0.05).cast("bfloat16")
-    return query, key, w_v
-
-
-def _rel(actual, expected):
-    a = actual.cast("float32")
-    e = expected.cast("float32")
-    return float((a - e).norm() / e.norm().clip(min=1e-12))
-
-
-def _dense_reference(query, key, w_v, row_end, scale, sink=None):
-    """Per-document full-causal attention on the latent, computed in fp32.
-
-    ``sink`` is a ``[H]`` per-head logit appended as one extra softmax column
-    that carries no value vector, i.e. it only drains probability mass -- the
-    exact semantics of ``attn_sink`` in the block-sparse kernel.
-    """
-    seqlen = int(query.shape[1])
-    doc_start, is_valid = _doc_meta(row_end, seqlen)
-    pos = np.arange(seqlen)
-    allowed = (
-        (pos[None, :] <= pos[:, None])
-        & (pos[None, :] >= doc_start[:, None])
-        & is_valid[:, None]
-    )
-    q = query[0].cast("float32")
-    k = key.squeeze(2)[0].cast("float32")
-    scores = paddle.einsum("shd,td->sht", q, k) * scale
-    keep = paddle.to_tensor(allowed).unsqueeze(1)
-    scores = paddle.where(keep, scores, paddle.full_like(scores, -1e30))
-    if sink is None:
-        probs = F.softmax(scores, axis=-1)
-    else:
-        sink_col = paddle.to_tensor(np.asarray(sink, dtype="float32")).reshape(
-            [1, H, 1]
-        )
-        sink_col = paddle.expand(sink_col, [seqlen, H, 1])
-        probs = F.softmax(paddle.concat([scores, sink_col], axis=-1), axis=-1)
-        probs = probs[:, :, :seqlen]
-    ctx = paddle.einsum("sht,tl->shl", probs, k[:, :DV])
-    out = paddle.einsum("shl,lhv->shv", ctx, w_v.cast("float32"))
-    row_ok = paddle.to_tensor(is_valid).cast("float32").reshape([seqlen, 1, 1])
-    return (out * row_ok).reshape([1, seqlen, H * V_HEAD_DIM])
-
-
-def _check_index_invariants(test, indices, row_end, seqlen, expect_full=False):
-    """Assert the per-row column set is sound.
-
-    Invariants: no duplicate column (a duplicate would double-count in the
-    softmax), every column causal and inside the query's own document, the
-    forced ``WINDOW`` columns always present, and pad rows select nothing.
-    """
-    doc_start, is_valid = _doc_meta(row_end, seqlen)
-    for q in range(seqlen):
-        cols = indices[0, q]
-        cols = cols[cols >= 0].tolist()
-        test.assertEqual(
-            len(cols), len(set(cols)), f"row {q}: duplicate column"
-        )
-        if not is_valid[q]:
-            test.assertEqual(cols, [], f"pad row {q} must select nothing")
-            continue
-        start = int(doc_start[q])
-        test.assertTrue(
-            all(start <= c <= q for c in cols),
-            f"row {q}: non-causal or cross-document column",
-        )
-        window = set(range(max(start, q - WINDOW + 1), q + 1))
-        test.assertEqual(
-            window - set(cols), set(), f"row {q}: lost forced-window columns"
-        )
-        if expect_full:
-            test.assertEqual(
-                set(cols),
-                set(range(start, q + 1)),
-                f"row {q}: not the full causal set",
-            )
 
 
 class TestMQAGuards(unittest.TestCase):
@@ -484,13 +195,13 @@ class TestMQAIndexRanges(unittest.TestCase):
 
 
 class TestHybridMLAConfig(unittest.TestCase):
-    """The hybrid MLA config surface after the ``un_absorbed_mqa`` refactor.
+    """The hybrid MLA config surface after the ``non_absorbed_mqa`` refactor.
 
     The old 3-state ``hybrid_mla_attn_mode`` and the ``hybrid_mla_attn_sink``
     switch (with its mutual-exclusion ValueError against the model-wide sinks)
-    are gone. There is now a single boolean ``un_absorbed_mqa`` and a single
+    are gone. There is now a single boolean ``non_absorbed_mqa`` and a single
     sink switch (``add_full_attention_sink_bias`` / ``softmax_type``), so the
-    two can no longer conflict. When ``un_absorbed_mqa=True`` the -2 layers run
+    two can no longer conflict. When ``non_absorbed_mqa=True`` the -2 layers run
     a cuDNN DSA indexer, so the config validates the model-wide ``dsa_index_*``
     fields (index_n_heads / index_head_dim / index_topk).
     """
@@ -515,11 +226,11 @@ class TestHybridMLAConfig(unittest.TestCase):
         return kwargs
 
     @classmethod
-    def _un_absorbed_kwargs(cls, **overrides):
-        # ``un_absorbed_mqa=True`` triggers the DSA-indexer validation, so a
+    def _non_absorbed_kwargs(cls, **overrides):
+        # ``non_absorbed_mqa=True`` triggers the DSA-indexer validation, so a
         # valid baseline must carry the model-wide index dims.
         base = {
-            "un_absorbed_mqa": True,
+            "non_absorbed_mqa": True,
             "dsa_index_n_heads": INDEX_HEADS,
             "dsa_index_head_dim": INDEX_HEAD_DIM,
             "dsa_index_topk": INDEX_TOPK,
@@ -527,51 +238,53 @@ class TestHybridMLAConfig(unittest.TestCase):
         base.update(overrides)
         return cls._kwargs(**base)
 
-    def test_un_absorbed_mqa_defaults_off(self):
+    def test_non_absorbed_mqa_defaults_off(self):
         config = TransformerConfig(**self._kwargs())
-        self.assertFalse(config.un_absorbed_mqa)
+        self.assertFalse(config.non_absorbed_mqa)
 
-    def test_un_absorbed_mqa_true_accepted_with_valid_index_dims(self):
-        config = TransformerConfig(**self._un_absorbed_kwargs())
-        self.assertTrue(config.un_absorbed_mqa)
+    def test_non_absorbed_mqa_true_accepted_with_valid_index_dims(self):
+        config = TransformerConfig(**self._non_absorbed_kwargs())
+        self.assertTrue(config.non_absorbed_mqa)
         self.assertEqual(config.dsa_index_head_dim, 128)
 
-    def test_sink_coexists_with_un_absorbed_mqa(self):
+    def test_sink_coexists_with_non_absorbed_mqa(self):
         # The old mutual-exclusion ValueError is gone: one sink switch only, so
-        # enabling a model-wide sink alongside un_absorbed_mqa must be accepted.
+        # enabling a model-wide sink alongside non_absorbed_mqa must be accepted.
         for sink in (
             {"add_full_attention_sink_bias": True},
             {"softmax_type": "learnable"},
         ):
             with self.subTest(sink=sink):
-                config = TransformerConfig(**self._un_absorbed_kwargs(**sink))
-                self.assertTrue(config.un_absorbed_mqa)
+                config = TransformerConfig(**self._non_absorbed_kwargs(**sink))
+                self.assertTrue(config.non_absorbed_mqa)
 
     def test_index_head_dim_must_be_128(self):
         with self.assertRaisesRegex(ValueError, "index_head_dim"):
-            TransformerConfig(**self._un_absorbed_kwargs(dsa_index_head_dim=64))
+            TransformerConfig(
+                **self._non_absorbed_kwargs(dsa_index_head_dim=64)
+            )
 
     def test_index_topk_must_be_multiple_of_128(self):
         with self.assertRaisesRegex(ValueError, "index_topk"):
-            TransformerConfig(**self._un_absorbed_kwargs(dsa_index_topk=100))
+            TransformerConfig(**self._non_absorbed_kwargs(dsa_index_topk=100))
 
     def test_index_topk_at_most_2048(self):
         with self.assertRaisesRegex(ValueError, "index_topk"):
             TransformerConfig(
-                **self._un_absorbed_kwargs(dsa_index_topk=2048 + 128)
+                **self._non_absorbed_kwargs(dsa_index_topk=2048 + 128)
             )
 
     def test_index_dims_must_be_positive_ints(self):
         with self.assertRaisesRegex(ValueError, "index_n_heads"):
             TransformerConfig(
-                **self._un_absorbed_kwargs(dsa_index_n_heads=None)
+                **self._non_absorbed_kwargs(dsa_index_n_heads=None)
             )
 
-    def test_index_dims_unvalidated_when_un_absorbed_mqa_off(self):
+    def test_index_dims_unvalidated_when_non_absorbed_mqa_off(self):
         # With the flag off the -2 layers are dense MHA; the indexer fields are
         # unused and left at their defaults without triggering the validation.
-        config = TransformerConfig(**self._kwargs(un_absorbed_mqa=False))
-        self.assertFalse(config.un_absorbed_mqa)
+        config = TransformerConfig(**self._kwargs(non_absorbed_mqa=False))
+        self.assertFalse(config.non_absorbed_mqa)
 
 
 @_GPU

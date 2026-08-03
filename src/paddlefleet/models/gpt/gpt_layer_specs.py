@@ -324,14 +324,14 @@ def get_attention_spec(
         # ``dsv4_hybrid`` puts these MLA layers next to CSA/HCA layers that
         # already read the model-wide ``index_*`` fields, so field presence
         # cannot decide anything here: the hybrid MLA layers are dense MHA
-        # unless ``un_absorbed_mqa`` explicitly turns them into non-absorbed
+        # unless ``non_absorbed_mqa`` explicitly turns them into non-absorbed
         # MQA + DSA indexer.
         is_hybrid_mla_indexer = (
             getattr(config, "experimental_attention_variant", None)
             == "dsv4_hybrid"
         )
-        un_absorbed_mqa = is_hybrid_mla_indexer and getattr(
-            config, "un_absorbed_mqa", False
+        non_absorbed_mqa = is_hybrid_mla_indexer and getattr(
+            config, "non_absorbed_mqa", False
         )
         use_dsa = (
             not is_hybrid_mla_indexer
@@ -339,7 +339,7 @@ def get_attention_spec(
             and getattr(config, "dsa_index_n_heads", None) is not None
         )
 
-        if un_absorbed_mqa:
+        if non_absorbed_mqa:
             # Non-absorbed MQA core attention on the KV latent; parameters stay
             # byte-identical to MHA so an MHA checkpoint loads unchanged. The
             # DSA indexer is what makes this mode worth running, so it is not

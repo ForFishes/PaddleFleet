@@ -828,7 +828,7 @@ class TransformerConfig(ModelParallelConfig):
     hybrid_mla_num_key_value_heads: int | None = None
     """Layer-local KV-head count for hybrid MLA entries."""
 
-    un_absorbed_mqa: bool = False
+    non_absorbed_mqa: bool = False
     """Run the hybrid MLA (``csa_compress_ratios == -2``) layers as non-absorbed
     MQA plus a DSA indexer, instead of plain multi-head latent attention.
 
@@ -1488,7 +1488,7 @@ class TransformerConfig(ModelParallelConfig):
                         "hybrid MLA dimensions must be explicit positive integers; "
                         f"invalid fields: {', '.join(invalid)}"
                     )
-                if self.un_absorbed_mqa:
+                if self.non_absorbed_mqa:
                     # The -2 layers' indexer reuses the CSA indexer fields. The
                     # cuDNN indexer forward requires D_i=128, its backward
                     # asserts topk % block_I == 0 with block_I=128, and
@@ -1508,14 +1508,14 @@ class TransformerConfig(ModelParallelConfig):
                     ]
                     if invalid_index:
                         raise ValueError(
-                            "un_absorbed_mqa=True runs a DSA indexer on the "
+                            "non_absorbed_mqa=True runs a DSA indexer on the "
                             "hybrid MLA layers and needs index_n_heads / "
                             "index_head_dim / index_topk as positive integers; "
                             f"invalid fields: {', '.join(invalid_index)}"
                         )
                     if self.dsa_index_head_dim != 128:
                         raise ValueError(
-                            "un_absorbed_mqa=True uses the cuDNN indexer, which "
+                            "non_absorbed_mqa=True uses the cuDNN indexer, which "
                             "requires index_head_dim=128, got "
                             f"{self.dsa_index_head_dim}."
                         )

@@ -14,11 +14,11 @@
 
 """A5 GRADIENT HEALTH validation for hybrid-MLA attention.
 
-Adversarial gradient validation of ``un_absorbed_mqa`` for the hybrid-MLA
+Adversarial gradient validation of ``non_absorbed_mqa`` for the hybrid-MLA
 layer (csa ratio == -2, experimental_attention_variant == "dsv4_hybrid").
 
-  * un_absorbed_mqa=False -- dense MLA (MLASelfAttention + DotProductAttention).
-  * un_absorbed_mqa=True  -- runtime activation-level absorption on the shared
+  * non_absorbed_mqa=False -- dense MLA (MLASelfAttention + DotProductAttention).
+  * non_absorbed_mqa=True  -- runtime activation-level absorption on the shared
       KV latent PLUS a cuDNN block-sparse DSA indexer (gpt_layer_specs always
       builds the indexer for such a layer). With the forced local window
       (``csa_window_size``) >= sequence length the indexer selects no extra
@@ -27,8 +27,8 @@ layer (csa ratio == -2, experimental_attention_variant == "dsv4_hybrid").
       the equivalence items below rely on.
 
 The old 3-state ``hybrid_mla_attn_mode`` {mha, mqa, mqa_dsa} collapsed onto
-this single boolean: "mha" -> un_absorbed_mqa=False and both "mqa"/"mqa_dsa"
--> un_absorbed_mqa=True (the DSA-less "mqa" is no longer reachable from
+this single boolean: "mha" -> non_absorbed_mqa=False and both "mqa"/"mqa_dsa"
+-> non_absorbed_mqa=True (the DSA-less "mqa" is no longer reachable from
 config, so its redundant parametrisation was dropped). The mode strings below
 are kept only as readable labels for ``_build``.
 
@@ -134,10 +134,10 @@ class _FakePGCollection:
 # --------------------------------------------------------------------------- #
 def _make_config(mode, sink, indexer=False, dtype=paddle.bfloat16):
     # ``indexer`` is vestigial: the hybrid-MLA layer's DSA indexer is now built
-    # unconditionally whenever ``un_absorbed_mqa`` is True (see
+    # unconditionally whenever ``non_absorbed_mqa`` is True (see
     # gpt_layer_specs), so it is retained only for call-site compatibility.
     del indexer
-    un_absorbed_mqa = mode != "mha"
+    non_absorbed_mqa = mode != "mha"
     cfg = TransformerConfig(
         num_hidden_layers=2,
         num_nextn_predict_layers=0,
@@ -161,7 +161,7 @@ def _make_config(mode, sink, indexer=False, dtype=paddle.bfloat16):
         hybrid_mla_v_head_dim=256,
         hybrid_mla_num_attention_heads=64,
         hybrid_mla_num_key_value_heads=64,
-        un_absorbed_mqa=un_absorbed_mqa,
+        non_absorbed_mqa=non_absorbed_mqa,
         add_full_attention_sink_bias=sink,
         o_groups=4,
         o_lora_rank=32,
@@ -175,7 +175,7 @@ def _make_config(mode, sink, indexer=False, dtype=paddle.bfloat16):
         # Indexer dims are model-wide now (HF json ``index_*``). The hybrid MLA
         # -2 layer's cuDNN indexer requires head_dim == 128 and topk % 128 == 0
         # (<= 2048); these carry the values the old ``hybrid_index_*`` fields
-        # held and satisfy the ``un_absorbed_mqa`` config validation.
+        # held and satisfy the ``non_absorbed_mqa`` config validation.
         dsa_index_n_heads=64,
         dsa_index_head_dim=128,
         dsa_index_topk=128,
@@ -237,9 +237,9 @@ def _fa4_for_mha_sink(mode, sink):
         paddle.set_flags({"FLAGS_flash_attn_version": previous})
 
 
-# Reachable modes (label, un_absorbed_mqa).  Via config there are only two:
-# dense MHA (un_absorbed_mqa=False) and the absorbed MQA+DSA-indexer path
-# (un_absorbed_mqa=True).  The old DSA-less "mqa" collapsed onto "mqa_dsa"
+# Reachable modes (label, non_absorbed_mqa).  Via config there are only two:
+# dense MHA (non_absorbed_mqa=False) and the absorbed MQA+DSA-indexer path
+# (non_absorbed_mqa=True).  The old DSA-less "mqa" collapsed onto "mqa_dsa"
 # (indexer always built), so its redundant entry was dropped.
 _MODES = (("mha", False), ("mqa_dsa", True))
 
@@ -384,29 +384,16 @@ class TestItem1StateDictAndGradientMatch(unittest.TestCase):
             np.testing.assert_array_equal(
                 got, ref, err_msg=f"{name} changed on load"
             )
-        print(
-            "A5[item1] mqa loaded mha state_dict unchanged; mha keys=",
-            len(mha_sd),
-            " indexer keys added=",
-            len(extra),
-        )
 
     def test_per_param_gradient_match_mqa_vs_mha(self):
         if not _HAS_DSA:
             self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
-        x = _hidden(self.SEQ, seed=0)
         re = _row_end(self.SEQ)
         mha = _build("mha", sink=False)
         mqa = _build("mqa", sink=False)
         mqa.set_state_dict(mha.state_dict())
         _, g_mha = _grads(mha, _hidden(self.SEQ, seed=0), re, weighted=True)
         _, g_mqa = _grads(mqa, _hidden(self.SEQ, seed=0), re, weighted=True)
-        print("\nA5[item1] per-param grad  mqa vs mha (reference)")
-        print(
-            f"  {'param':<26} {'cos':>10} {'normRatio':>10} "
-            f"{'|mha|':>12} {'relL2':>12}"
-        )
-        worst_cos, worst_ratio = 1.0, 1.0
         for key in _EXPECTED_PARAMS:
             n_mha = [k for k in g_mha if k.endswith(key)]
             n_mqa = [k for k in g_mqa if k.endswith(key)]
@@ -415,20 +402,10 @@ class TestItem1StateDictAndGradientMatch(unittest.TestCase):
             cos = _cos(a, b)
             nb = _norm(b)
             ratio = (_norm(a) / nb) if nb > 0 else float("nan")
-            rel = _rel_err(a, b)
-            print(
-                f"  {key:<26} {cos:>10.6f} {ratio:>10.5f} "
-                f"{nb:>12.4e} {rel:>12.4e}"
-            )
-            worst_cos = min(worst_cos, cos)
-            worst_ratio = min(worst_ratio, abs(ratio))
             self.assertGreater(cos, 0.999, f"{key} cosine too low ({cos})")
             self.assertTrue(
                 0.95 < ratio < 1.05, f"{key} grad-norm ratio off ({ratio})"
             )
-        print(
-            f"A5[item1] worst cos={worst_cos:.6f} worst |ratio|={worst_ratio:.5f}"
-        )
 
 
 @_skip_if_no_cuda
@@ -461,10 +438,6 @@ class TestItem2AbsoluteMagnitudeSanity(unittest.TestCase):
         a = o_mha.numpy()
         b = o_mqa.numpy()
         rel = _rel_err(b, a)
-        max_abs = float(np.abs(a).max())
-        print(
-            f"\nA5[item2] fwd equivalence  |out|max={max_abs:.4e} relL2(mqa,mha)={rel:.4e}"
-        )
         # If the softmax scale were dropped/doubled, or the einsum lost a
         # 1/sqrt(d), the outputs would differ by >> bf16 noise.
         self.assertLess(
@@ -474,7 +447,6 @@ class TestItem2AbsoluteMagnitudeSanity(unittest.TestCase):
     def test_grad_norm_ratio_not_on_a_suspicious_constant(self):
         if not _HAS_DSA:
             self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
-        x = _hidden(self.SEQ, seed=4)
         re = _row_end(self.SEQ)
         mha = _build("mha", sink=False)
         mqa = _build("mqa", sink=False)
@@ -487,7 +459,6 @@ class TestItem2AbsoluteMagnitudeSanity(unittest.TestCase):
             "1/scale": 16.0,
             "sqrt_qhd": 16.0,
         }
-        print("\nA5[item2] grad-norm ratios vs suspicious constants")
         for key in _EXPECTED_PARAMS:
             a = g_mqa[next(k for k in g_mqa if k.endswith(key))]
             b = g_mha[next(k for k in g_mha if k.endswith(key))]
@@ -498,7 +469,6 @@ class TestItem2AbsoluteMagnitudeSanity(unittest.TestCase):
                     abs(ratio - c) < 0.2 * c,
                     f"{key} grad ratio {ratio:.4f} ~= {label}({c})",
                 )
-            print(f"  {key:<26} ratio={ratio:.5f}  (OK, ~1.0 expected)")
 
 
 @_skip_if_no_cuda
@@ -552,11 +522,6 @@ class TestItem3SinkGradient(unittest.TestCase):
             sink.add_(paddle.full_like(sink, h))
         fd = (lp - lm) / (2 * h)
         rel = abs(fd - analytic_sum) / max(abs(fd), abs(analytic_sum), 1e-6)
-        print(
-            f"\nA5[item3] mqa sink grad sum analytic={analytic_sum:.5f} finite-diff={fd:.5f} "
-            f"rel={rel:.4f}"
-        )
-        print("A5[item3] mqa sink grad[:8]=", np.round(g[:8], 4).tolist())
         self.assertLess(
             rel, 0.30, "analytic sink grad disagrees with finite diff"
         )
@@ -578,26 +543,12 @@ class TestItem3SinkGradient(unittest.TestCase):
                 # mha + sink hits the FA4-cute-only assertion when the cute
                 # kernel is unavailable (this env): forward RAISES.
                 results[mode] = ("RAISES:" + type(e).__name__, None, None)
-                print(
-                    f"A5[item3] {mode:<8} sink forward RAISES "
-                    f"{type(e).__name__}"
-                )
                 continue
             sk = [k for k in g if k.endswith("softmax_offset")]
             op = [k for k in g if k.endswith("o_proj.weight")]
             g_sink = g[sk[0]] if sk else None
             g_op = g[op[0]] if op else None
             results[mode] = ("ok", g_sink, g_op)
-            if g_sink is None:
-                print(f"A5[item3] {mode:<8} sink grad = None (INERT)")
-            else:
-                ratio = _norm(g_sink) / max(_norm(g_op), 1e-12)
-                signs = np.sign(g_sink[:6]).astype(int).tolist()
-                print(
-                    f"A5[item3] {mode:<8} |g_sink|={_norm(g_sink):.4e} "
-                    f"|g_oproj|={_norm(g_op):.4e} "
-                    f"ratio={ratio:.4e} signs={signs}"
-                )
 
         # The absorbed (mqa_dsa) sink must be live, finite and non-zero.
         if _HAS_DSA and "mqa_dsa" in results:
@@ -605,16 +556,6 @@ class TestItem3SinkGradient(unittest.TestCase):
             self.assertIsNotNone(gs, "mqa_dsa sink must receive gradient")
             self.assertTrue(np.all(np.isfinite(gs)))
             self.assertGreater(np.abs(gs).max(), 0.0)
-        # CRITICAL env caveat: mha sink either inert (None) or crashes here.
-        if "mha" in results:
-            status = results["mha"][0]
-            if status.startswith("RAISES") or results["mha"][1] is None:
-                print(
-                    "A5[item3] CRITICAL: mha sink is non-functional in this "
-                    f"env ({status}) -- the FA4 'cute' flashmask kernel that "
-                    "consumes learnable_sink is unavailable. mha-side sink "
-                    "cannot be validated here; see report bug list."
-                )
 
 
 @_skip_if_no_cuda
@@ -645,10 +586,6 @@ class TestItem4GradientFlowCompleteness(unittest.TestCase):
                 sink_state = "DEAD"
             else:
                 sink_state = "live"
-        print(
-            f"A5[item4] {mode:<8} sink={sink!s:<5} -> "
-            f"missing={missing} dead={dead} sink={sink_state}"
-        )
         return missing, dead, sink_state
 
     def test_all_weight_params_receive_gradient(self):
@@ -672,27 +609,20 @@ class TestItem4GradientFlowCompleteness(unittest.TestCase):
                         )
 
     def test_train_mode_backward_if_reachable(self):
-        # train() enables the CSA/DSA autoscaler PyLayer; document whether a
+        # train() enables the CSA/DSA autoscaler PyLayer; exercise whether a
         # plain backward is reachable there for the mqa path.
         if not _HAS_DSA:
             self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
         m = _build("mqa", sink=True, indexer=False)
         m.train()
-        try:
+        with contextlib.suppress(Exception):
+            # autoscaler inplace / recompute limitation may make this raise.
             out, _ = m(
                 _hidden(self.SEQ, seed=2),
                 attention_mask=None,
                 attn_mask_startend_row_indices=_row_end(self.SEQ),
             )
             out.astype("float32").sum().backward()
-            reachable = True
-            err = ""
-        except Exception as e:  # autoscaler inplace / recompute limitation
-            reachable = False
-            err = type(e).__name__
-        print(
-            f"A5[item4] mqa train()-mode backward reachable={reachable} {err}"
-        )
 
 
 @_skip_if_no_cuda
@@ -730,13 +660,10 @@ class TestItem5NumericalHealthUnderStress(unittest.TestCase):
             ("sink_-30", seq, 1.0, None, -30.0),
         ]
         first_bad = None
-        print("\nA5[item5] mqa numerical stress")
         for label, s, scale, docs, sink in configs:
-            status, bad = self._run("mqa", False, s, scale, docs, sink)
-            print(f"  {label:<14} -> {status} {bad if bad else ''}")
+            status, _ = self._run("mqa", False, s, scale, docs, sink)
             if status != "finite" and first_bad is None:
                 first_bad = label
-        print(f"A5[item5] first non-finite config: {first_bad}")
         self.assertIsNone(
             first_bad, f"non-finite gradients first at: {first_bad}"
         )
@@ -752,13 +679,10 @@ class TestItem5NumericalHealthUnderStress(unittest.TestCase):
             ("sink_-30", seq, 1.0, None, -30.0),
         ]
         first_bad = None
-        print("\nA5[item5] mqa_dsa numerical stress")
         for label, s, scale, docs, sink in configs:
-            status, bad = self._run("mqa_dsa", True, s, scale, docs, sink)
-            print(f"  {label:<14} -> {status} {bad if bad else ''}")
+            status, _ = self._run("mqa_dsa", True, s, scale, docs, sink)
             if status != "finite" and first_bad is None:
                 first_bad = label
-        print(f"A5[item5] mqa_dsa first non-finite config: {first_bad}")
         self.assertIsNone(first_bad)
 
 
@@ -789,15 +713,12 @@ class TestItem6DtypePrecisionFloor(unittest.TestCase):
         sd = {k: v.astype("bfloat16") for k, v in m32.state_dict().items()}
         m16.set_state_dict(sd)
         _, g16 = _grads(m16, _hidden(self.SEQ, seed=0), re, weighted=True)
-        print("\nA5[item6] bf16-vs-fp32 mha grad relative L2 (precision floor)")
         worst = 0.0
         for key in _EXPECTED_PARAMS:
             a = g16[next(k for k in g16 if k.endswith(key))]
             b = g32[next(k for k in g32 if k.endswith(key))]
             rel = _rel_err(a.astype(np.float64), b.astype(np.float64))
             worst = max(worst, rel)
-            print(f"  {key:<26} relL2={rel:.4e}")
-        print(f"A5[item6] worst bf16 grad relL2 vs fp32 = {worst:.4e}")
         # bf16 has ~3 decimal digits; a few % relative error is the floor.
         self.assertLess(worst, 0.10, "bf16 grad error exceeds bf16 floor")
 
@@ -844,12 +765,6 @@ class TestItem7MultiStepStability(unittest.TestCase):
         return losses, gnorms
 
     def _report(self, tag, losses, gnorms):
-        print(
-            f"\nA5[item7] {tag} curve (loss | gnorm) over "
-            f"{len(losses)} SGD steps @ lr={self.LR:g}"
-        )
-        for i, (lo, gn) in enumerate(zip(losses, gnorms)):
-            print(f"  step {i:2d}  loss={lo:.6f}  gnorm={gn:.4e}")
         self.assertTrue(all(np.isfinite(losses)), f"{tag}: non-finite loss")
         self.assertTrue(all(np.isfinite(gnorms)), f"{tag}: non-finite gnorm")
         # No runaway: final grad norm within 100x of the first.
@@ -859,7 +774,6 @@ class TestItem7MultiStepStability(unittest.TestCase):
 
     def test_mha_control(self):
         losses, gnorms = self._run_steps("mha", False, sink=False)
-        print()
         self._report("mha", losses, gnorms)
 
     def test_mqa_dsa_with_sink(self):
@@ -894,21 +808,8 @@ class TestItem8WeightDecayInteraction(unittest.TestCase):
         grad_step = self.LR * float(np.abs(gs).mean())
         decay_step = self.LR * self.WD * sink_val
         ratio = decay_step / max(grad_step, 1e-12)
-        print(
-            "\nA5[item8] sink receives weight decay (name has no "
-            "bias/norm/multimax token)"
-        )
-        print(
-            f"  mean|d_sink|={float(np.abs(gs).mean()):.4f}  grad_step={grad_step:.3e}  decay_step(@|s|=1)={decay_step:.3e}  "
-            f"decay/grad={ratio:.4f}"
-        )
         # Decay is a real, non-negligible systematic pull toward 0 on the sink.
         self.assertGreater(ratio, 0.0)
-        print(
-            "A5[item8] VERDICT: weight decay applies to a 1-D attention-sink "
-            "logit; pull is %.2f%% of the per-step gradient move at |s|=1."
-            % (100.0 * ratio)
-        )
 
 
 if __name__ == "__main__":

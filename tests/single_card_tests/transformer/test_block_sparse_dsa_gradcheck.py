@@ -66,16 +66,6 @@ _GPU = unittest.skipUnless(
     "requires SM100+ FlashMLA sparse fwd + cuDNN DSA bwd kernels",
 )
 
-# Collected measurements, dumped at the end of the run so the markdown report
-# can quote exact numbers rather than being hand-transcribed.
-MEASUREMENTS = []
-
-
-def _log(tag, **kv):
-    MEASUREMENTS.append((tag, dict(kv)))
-    body = "  ".join(f"{k}={v}" for k, v in kv.items())
-    print(f"[A3] {tag}: {body}", flush=True)
-
 
 # ---------------------------------------------------------------------------
 # Input construction
@@ -202,16 +192,11 @@ def _relerr(a, b):
 
 
 def _err_stats(a, b):
+    # Only the two fields asserted on downstream: max abs error and L2 rel.
     a = np.asarray(a, np.float64)
     b = np.asarray(b, np.float64)
-    ae = np.abs(a - b)
-    mask = np.abs(b) > 1e-2  # relative error only where the ref is non-tiny
-    rel = (ae[mask] / np.abs(b[mask])) if mask.any() else np.array([0.0])
     return {
-        "maxabs": round(float(ae.max()), 6),
-        "meanabs": round(float(ae.mean()), 8),
-        "p99abs": round(float(np.percentile(ae, 99)), 6),
-        "maxrel": round(float(rel.max()), 5),
+        "maxabs": round(float(np.abs(a - b).max()), 6),
         "l2rel": round(_relerr(a, b), 6),
     }
 
@@ -288,7 +273,6 @@ class TestForward(_Base):
             with self.subTest(H=H):
                 o, r = self._run(H, 96, 128, None, 100 + H)
                 st = _err_stats(o, r)
-                _log(f"fwd sinkless H={H}", **st)
                 self.assertLess(st["maxabs"], 8e-3)
                 self.assertLess(st["l2rel"], 8e-3)
 
@@ -298,19 +282,13 @@ class TestForward(_Base):
             with self.subTest(sink=sink):
                 o, r = self._run(8, 96, 128, sink, 200)
                 st = _err_stats(o, r)
-                _log(f"fwd sink={sink:+g}", **st)
                 self.assertLess(st["maxabs"], 8e-3)
                 self.assertLess(st["l2rel"], 1e-2)
 
     def test_forward_error_distribution(self):
         o, r = self._run(8, 128, 128, None, 7)
         ae = np.abs(o.astype(np.float64) - r)
-        pct = {
-            f"p{p}": round(float(np.percentile(ae, p)), 6)
-            for p in (50, 90, 99, 100)
-        }
-        _log("fwd err-distribution", **pct)
-        self.assertLess(pct["p100"], 8e-3)
+        self.assertLess(float(ae.max()), 8e-3)  # p100 == max abs error
 
 
 # ===========================================================================
@@ -334,8 +312,6 @@ class TestBackwardAnalytic(_Base):
             with self.subTest(H=H):
                 (kq, kkv, _), (rq, rkv, _) = self._case(H, 64, 128, None, 30)
                 sq, skv = _err_stats(kq, rq), _err_stats(kkv, rkv)
-                _log(f"bwd sinkless H={H} dQ", **sq)
-                _log(f"bwd sinkless H={H} dKV", **skv)
                 self.assertLess(sq["l2rel"], 1e-2)
                 self.assertLess(skv["l2rel"], 8e-3)
 
@@ -347,9 +323,6 @@ class TestBackwardAnalytic(_Base):
                 )
                 sq, skv = _err_stats(kq, rq), _err_stats(kkv, rkv)
                 ds = _err_stats(ks[0].numpy(), rs)
-                _log(f"bwd sink={sink_mag:+g} dQ", **sq)
-                _log(f"bwd sink={sink_mag:+g} dKV", **skv)
-                _log(f"bwd sink={sink_mag:+g} d_sink", **ds)
                 self.assertLess(sq["l2rel"], 1e-2)
                 self.assertLess(skv["l2rel"], 8e-3)
                 self.assertLess(ds["l2rel"], 2e-2)
@@ -398,13 +371,6 @@ class TestFiniteDifference(_Base):
                 - _proj_forward(q, kv, ti, dO, sm_)
             ) / (2 * eps)
         rel = _relerr(d_analytic, d_fd)
-        _log(
-            "FD sink central-diff",
-            eps=eps,
-            l2rel=round(rel, 5),
-            analytic=np.round(d_analytic, 3).tolist(),
-            numeric=np.round(d_fd, 3).tolist(),
-        )
         self.assertLess(rel, 5e-2)
 
 
@@ -427,7 +393,7 @@ class TestAdjoint(_Base):
         kq, kkv, ks = _kernel_grads(q, kv, ti, dO, sink_mag)
         return q, kv, ti, dO, kq, kkv, ks
 
-    def _dir_check(self, tag, fwd_at, base, g, eps_scale, tol):
+    def _dir_check(self, fwd_at, base, g, tol):
         v = g / (np.linalg.norm(g) + 1e-30) * np.linalg.norm(base)
         best = None
         for eps in (0.02, 0.05, 0.1):
@@ -435,34 +401,23 @@ class TestAdjoint(_Base):
             gv = float((g * v).sum())
             rel = abs(jv - gv) / (abs(gv) + 1e-30)
             best = rel if best is None else min(best, rel)
-        _log(
-            tag,
-            dir_deriv=round(jv, 4),
-            grad_dot_v=round(gv, 4),
-            best_rel=round(best, 5),
-        )
         self.assertLess(best, tol)
 
     def test_adjoint_q(self):
         q, kv, ti, dO, kq, _, _ = self._setup()
-        H = q.shape[2]
         self._dir_check(
-            "adjoint q",
             lambda qn: _proj_forward(qn.reshape(q.shape), kv, ti, dO),
             q[0].reshape(-1),
             kq.reshape(-1),
-            1.0,
             2e-2,
         )
 
     def test_adjoint_kv(self):
         q, kv, ti, dO, _, kkv, _ = self._setup()
         self._dir_check(
-            "adjoint kv",
             lambda kn: _proj_forward(q, kn.reshape(kv.shape), ti, dO),
             kv[0].reshape(-1),
             kkv.reshape(-1),
-            1.0,
             2e-2,
         )
 
@@ -470,11 +425,9 @@ class TestAdjoint(_Base):
         q, kv, ti, dO, _, _, ks = self._setup(sink_mag=1.5)
         base = np.full([q.shape[2]], 1.5, "float32")
         self._dir_check(
-            "adjoint sink",
             lambda sn: _proj_forward(q, kv, ti, dO, sn.tolist()),
             base,
             ks[0].numpy(),
-            1.0,
             5e-2,
         )
 
@@ -495,7 +448,6 @@ class TestSinkSpecifics(_Base):
         for mag in (-5.0, -20.0, -60.0):
             out, _ = _kernel_forward(q, kv, ti, [mag] * H)
             d = float(np.abs(out.cast("float32").numpy() - base).max())
-            _log(f"sink->sinkless mag={mag:+g}", maxabs_vs_sinkless=round(d, 8))
             if prev is not None:
                 self.assertLessEqual(d, prev + 1e-6)  # monotone convergence
             prev = d
@@ -509,7 +461,6 @@ class TestSinkSpecifics(_Base):
         dO = _rand([1, s, H * DV], 1.0, 73)
         _, _, ks = _kernel_grads(q, kv, ti, dO, float(_NEG_SINK))
         g = ks[0].numpy()
-        _log("d_sink at -1e30", maxabs=float(np.abs(g).max()))
         self.assertLess(float(np.abs(g).max()), 1e-6)
 
     def test_dsink_sign_matches_numeric(self):
@@ -524,7 +475,6 @@ class TestSinkSpecifics(_Base):
         _, _, rs = _analytic_ref_grads(q, kv, ti, dO, 1.0)
         ka, ra = ks[0].numpy(), rs
         agree = float(np.mean(np.sign(ka) == np.sign(ra)))
-        _log("d_sink sign-agreement vs ref", frac=round(agree, 3))
         self.assertEqual(agree, 1.0)
 
     def test_finite_sink_lse_fix_matters(self):
@@ -541,11 +491,6 @@ class TestSinkSpecifics(_Base):
             kq, _, _ = _kernel_grads(q, kv, ti, dO, 3.0)
             res[fix] = _relerr(kq, rq)
         os.environ[_FIX_ENV] = "1"
-        _log(
-            "finite-sink-fix dQ l2rel",
-            fix_on=round(res["1"], 5),
-            fix_off=round(res["0"], 5),
-        )
         self.assertLess(res["1"], 1e-2)
         self.assertGreater(res["0"], 0.5)
         self.assertLess(res["1"], res["0"] * 0.05)
@@ -574,11 +519,6 @@ class TestIndexEdgeCases(_Base):
         ti_dedup = ti.copy()
         ti_dedup[0, 5, :4] = [0, 1, 2, -1]
         r_dedup = _ref_forward_np(q, kv, ti_dedup)[5]
-        _log(
-            "duplicate index",
-            rel_vs_doublecount=_relerr(o, r_dup),
-            rel_vs_dedup=round(_relerr(o, r_dedup), 4),
-        )
         self.assertLess(_relerr(o, r_dup), 1e-2)
         self.assertGreater(_relerr(o, r_dedup), 0.1)
 
@@ -595,11 +535,6 @@ class TestIndexEdgeCases(_Base):
         o1 = self._fwd(q, kv, t1)[5]
         o2 = self._fwd(q, kv, t2)[5]
         r = _ref_forward_np(q, kv, t1)[5]
-        _log(
-            "unsorted vs sorted",
-            maxabs_perm=float(np.abs(o1 - o2).max()),
-            rel_vs_ref=round(_relerr(o1, r), 5),
-        )
         np.testing.assert_array_equal(o1, o2)
         self.assertLess(_relerr(o1, r), 8e-3)
 
@@ -618,11 +553,6 @@ class TestIndexEdgeCases(_Base):
         o = self._fwd(q, kv, masked)[7]
         r = _ref_forward_np(q, kv, masked)[7]  # ref excludes -1 too
         r_full = _ref_forward_np(q, kv, full)[7]
-        _log(
-            "-1 masking",
-            rel_vs_ref=round(_relerr(o, r), 5),
-            differs_from_full=round(_relerr(r, r_full), 4),
-        )
         self.assertLess(_relerr(o, r), 8e-3)
         self.assertGreater(_relerr(r, r_full), 1e-3)
 
@@ -641,12 +571,6 @@ class TestIndexEdgeCases(_Base):
         self.assertEqual(float(np.abs(o3[0] - kvf[0, :DV][None]).max()), 0.0)
         self.assertEqual(float(np.abs(o3[1] - kvf[1, :DV][None]).max()), 0.0)
         empty = o3[2]
-        _log(
-            "edge rows",
-            single_col_exact=True,
-            empty_row_max=float(np.abs(empty).max()),
-            empty_finite=bool(np.isfinite(empty).all()),
-        )
         self.assertTrue(bool(np.isfinite(empty).all()))
         self.assertEqual(float(np.abs(empty).max()), 0.0)
 
@@ -678,7 +602,6 @@ class TestDtypeBehaviour(_Base):
         ):
             _, _, ks = _kernel_grads(q, kv, ti, dO, 1.0, sink_dtype=dt)
             grad, gdt = ks
-            _log(f"sink grad dtype ({dt})", returned=str(gdt))
             self.assertEqual(gdt, pdt)
             self.assertTrue(bool(paddle.isfinite(grad.astype("float32")).all()))
             self.assertGreater(float(grad.astype("float32").abs().max()), 0.0)
@@ -692,7 +615,6 @@ class TestDtypeBehaviour(_Base):
         out, _ = _kernel_forward(q, kv, ti, None)
         ref = _ref_forward_np(q, kv, ti, None)
         st = _err_stats(out.cast("float32").numpy()[0], ref)
-        _log("bf16 fwd round-off floor", **st)
         self.assertLess(st["l2rel"], 8e-3)
 
 
@@ -724,17 +646,7 @@ class TestDeterminism(_Base):
         o2, gq2, gk2 = once()
         fwd_eq = np.array_equal(o1, o2)
         dq_eq = np.array_equal(gq1, gq2)
-        dkv_eq = np.array_equal(gk1, gk2)
         dkv_rel = _relerr(gk1, gk2)
-        dkv_maxabs = float(np.abs(gk1 - gk2).max())
-        _log(
-            "determinism",
-            fwd_bitwise=fwd_eq,
-            dQ_bitwise=dq_eq,
-            dKV_bitwise=dkv_eq,
-            dKV_rel=round(dkv_rel, 9),
-            dKV_maxabs=dkv_maxabs,
-        )
         # Forward and dQ are bitwise reproducible. dKV is NOT (finding A3-1):
         # the cuDNN DSA backward's dKV scatter-add is non-deterministic even
         # with FLAGS_cudnn_deterministic=True. The magnitude is tiny (rel
@@ -746,12 +658,6 @@ class TestDeterminism(_Base):
         self.assertLess(
             dkv_rel, 1e-4, "dKV non-determinism exceeds the bounded floor"
         )
-
-
-def tearDownModule():
-    print("\n===== A3 MEASUREMENT DUMP =====", flush=True)
-    for tag, kv in MEASUREMENTS:
-        print(f"{tag}\t{kv}", flush=True)
 
 
 if __name__ == "__main__":

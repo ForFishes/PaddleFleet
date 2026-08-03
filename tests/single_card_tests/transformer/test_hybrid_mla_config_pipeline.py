@@ -21,20 +21,20 @@ fallback and then runs degraded without error.
 
 The three production configs under test (43 decoder layers + 1 MTP):
 
-* ``ernielite_layer43_mla_hca``      -- baseline, ``un_absorbed_mqa`` unset
+* ``ernielite_layer43_mla_hca``      -- baseline, ``non_absorbed_mqa`` unset
                                         (defaults ``False`` -> dense MHA on the
                                         ``-2`` layers), no sink.
-* ``ernielite_layer43_mla_mqa_hca``  -- ``un_absorbed_mqa=True`` + sink
+* ``ernielite_layer43_mla_mqa_hca``  -- ``non_absorbed_mqa=True`` + sink
                                         (``add_full_attention_sink_bias``).
 * ``ernielite_layer43_mla_dsa_hca``  -- now *identical in meaning* to the mqa
                                         config: the DSA-less "mqa" mode is no
                                         longer reachable from config, so
-                                        ``un_absorbed_mqa`` always builds the
+                                        ``non_absorbed_mqa`` always builds the
                                         DSA indexer. It is kept as a separate
                                         JSON only for the live comparison runs.
 
 The ``-2`` layers no longer carry hybrid-specific ``hybrid_index_*`` / mode /
-sink fields. ``un_absorbed_mqa`` (bool) selects non-absorbed MQA + DSA indexer
+sink fields. ``non_absorbed_mqa`` (bool) selects non-absorbed MQA + DSA indexer
 vs dense MHA; the indexer reuses the model-wide ``index_*`` (json) /
 ``dsa_index_*`` (provider) fields, and the sink comes from the model-wide
 ``add_full_attention_sink_bias``.
@@ -251,7 +251,7 @@ class TestLayerDispatchTable(unittest.TestCase):
         self._assert_table(_MHA, "DotProductAttention", None)
 
     def test_mqa_uses_mqa_latent_with_dsa_indexer(self):
-        # ``un_absorbed_mqa`` always builds the DSA indexer now (the DSA-less
+        # ``non_absorbed_mqa`` always builds the DSA indexer now (the DSA-less
         # "mqa" mode is unreachable from config), so mqa dispatches exactly like
         # dsa: MQALatentAttention core + DSAIndexer.
         self._assert_table(_MQA, "MQALatentAttention", "DSAIndexer")
@@ -263,12 +263,12 @@ class TestLayerDispatchTable(unittest.TestCase):
         # The JSON switches must survive onto the provider (not silently
         # defaulted). mha leaves both unset -> False; mqa/dsa set both True.
         mha = _load_provider(_MHA)[1]
-        self.assertFalse(getattr(mha, "un_absorbed_mqa", False))
+        self.assertFalse(getattr(mha, "non_absorbed_mqa", False))
         self.assertFalse(getattr(mha, "add_full_attention_sink_bias", False))
         for name in (_MQA, _DSA):
             with self.subTest(config=name):
                 prov = _load_provider(name)[1]
-                self.assertTrue(prov.un_absorbed_mqa)
+                self.assertTrue(prov.non_absorbed_mqa)
                 self.assertTrue(prov.add_full_attention_sink_bias)
 
 
@@ -280,7 +280,7 @@ class TestSinkParameterOnRealModules(unittest.TestCase):
 
     Consumer: ``build_softmax_offset`` (dot_product_attention.py:87), called by
     BOTH ``DotProductAttention.__init__`` (MHA phase) and
-    ``MQALatentAttention.__init__`` (un_absorbed_mqa phase). Proves the
+    ``MQALatentAttention.__init__`` (non_absorbed_mqa phase). Proves the
     model-wide ``add_full_attention_sink_bias`` JSON flag reaches a real bf16
     [num_heads] param at the SAME state_dict key
     (``core_attention.softmax_offset``) in both phases -- which is what keeps an
@@ -499,7 +499,7 @@ class TestConfigCheckCoverage(unittest.TestCase):
     """
 
     _NEW_FIELDS = (
-        "un_absorbed_mqa",
+        "non_absorbed_mqa",
         "add_full_attention_sink_bias",
         "hybrid_mla_q_lora_rank",
         "hybrid_mla_kv_lora_rank",
@@ -555,43 +555,45 @@ class TestIndexerLossNormalization(unittest.TestCase):
     Consumer: ``DSAIndexerLossLoggingHelper.track_indexer_metrics``
     (dsa_attention.py:1247-1257) fed from the pretraining trainer. When
     ``csa_compress_ratios`` is passed, the CSA layers (1 < ratio < 128) are
-    counted, and if ``un_absorbed_mqa`` is set the ``-2`` (hybrid MLA) entries
+    counted, and if ``non_absorbed_mqa`` is set the ``-2`` (hybrid MLA) entries
     are added too, so the loss is normalised by indexer-layer count (6), not the
     total layer count (44). This replicates that exact counting expression on
     the production ratios.
     """
 
-    def _num_indexer_layers(self, ratios, un_absorbed_mqa):
+    def _num_indexer_layers(self, ratios, non_absorbed_mqa):
         n = sum(1 for r in ratios if 1 < r < 128)
-        if un_absorbed_mqa:
+        if non_absorbed_mqa:
             n += sum(1 for r in ratios if r == -2)
         return n
 
-    def test_counts_six_indexer_layers_when_un_absorbed_mqa(self):
-        # Both mqa and dsa set un_absorbed_mqa=True now, so both count the six
+    def test_counts_six_indexer_layers_when_non_absorbed_mqa(self):
+        # Both mqa and dsa set non_absorbed_mqa=True now, so both count the six
         # -2 layers (no CSA 1<ratio<128 layers exist here).
         for name in (_MQA, _DSA):
             with self.subTest(config=name):
                 cfg = _load_json(name)
                 ratios = cfg["csa_compress_ratios"]
                 self.assertEqual(len(ratios), 44)
-                self.assertIs(cfg.get("un_absorbed_mqa"), True)
+                self.assertIs(cfg.get("non_absorbed_mqa"), True)
                 self.assertEqual(
                     self._num_indexer_layers(
-                        ratios, cfg.get("un_absorbed_mqa", False)
+                        ratios, cfg.get("non_absorbed_mqa", False)
                     ),
                     6,
                 )
 
     def test_no_indexer_layers_for_mha_baseline(self):
-        # mha leaves un_absorbed_mqa unset (-> False): no CSA (1<ratio<128)
+        # mha leaves non_absorbed_mqa unset (-> False): no CSA (1<ratio<128)
         # layers exist and 128 (HCA) is excluded, so the count is 0 -- the
         # counting expression must NOT collapse to the 44 total.
         cfg = _load_json(_MHA)
         ratios = cfg["csa_compress_ratios"]
-        self.assertNotIn("un_absorbed_mqa", cfg)
+        self.assertNotIn("non_absorbed_mqa", cfg)
         self.assertEqual(
-            self._num_indexer_layers(ratios, cfg.get("un_absorbed_mqa", False)),
+            self._num_indexer_layers(
+                ratios, cfg.get("non_absorbed_mqa", False)
+            ),
             0,
         )
 
@@ -637,13 +639,13 @@ class TestConfigDeltas(unittest.TestCase):
         # hybrid_mla_attn_mode / hybrid_mla_attn_sink pair is gone).
         self.assertEqual(
             set(delta(mha, mqa)),
-            {"un_absorbed_mqa", "add_full_attention_sink_bias"},
+            {"non_absorbed_mqa", "add_full_attention_sink_bias"},
         )
-        self.assertIs(mqa["un_absorbed_mqa"], True)
+        self.assertIs(mqa["non_absorbed_mqa"], True)
         self.assertIs(mqa["add_full_attention_sink_bias"], True)
 
         # mqa and dsa are now IDENTICAL in meaning: the DSA-less "mqa" mode is
-        # unreachable from config, so un_absorbed_mqa always builds the indexer
+        # unreachable from config, so non_absorbed_mqa always builds the indexer
         # and the old dsa-only hybrid_index_* keys were removed. The former
         # "mode + hybrid_index_*" delta no longer exists -- assert the two JSONs
         # are byte-for-value identical instead.
@@ -653,7 +655,7 @@ class TestConfigDeltas(unittest.TestCase):
         # The live-reference mha baseline must not carry either switch, so it
         # stays dense MHA with no sink.
         mha = _load_json(_MHA)
-        self.assertNotIn("un_absorbed_mqa", mha)
+        self.assertNotIn("non_absorbed_mqa", mha)
         self.assertNotIn("add_full_attention_sink_bias", mha)
 
 

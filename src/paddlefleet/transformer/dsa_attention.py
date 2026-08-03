@@ -1220,7 +1220,7 @@ class DSAIndexerLossLoggingHelper:
         total_loss_dict: dict | None = None,
         num_layers: int | None = None,
         csa_compress_ratios: list[int] | None = None,
-        un_absorbed_mqa: bool = False,
+        non_absorbed_mqa: bool = False,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -1231,7 +1231,7 @@ class DSAIndexerLossLoggingHelper:
             total_loss_dict: Dictionary to accumulate total losses (optional).
             num_layers: Total number of layers with indexer metrics.
             csa_compress_ratios: Per-layer CSA compress ratios.
-            un_absorbed_mqa: ``un_absorbed_mqa`` of a DSV4 hybrid model; when
+            non_absorbed_mqa: ``non_absorbed_mqa`` of a DSV4 hybrid model; when
                 set, the ``-2`` (MLA) entries run an indexer too, so they must
                 be counted here.
         """
@@ -1250,7 +1250,7 @@ class DSAIndexerLossLoggingHelper:
             num_indexer_layers = sum(
                 1 for ratio in csa_compress_ratios if 1 < ratio < 128
             )
-            if un_absorbed_mqa:
+            if non_absorbed_mqa:
                 # Hybrid MLA entries (-2) carry their own token-level indexer.
                 num_indexer_layers += sum(
                     1 for ratio in csa_compress_ratios if ratio == -2
