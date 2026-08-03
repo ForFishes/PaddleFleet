@@ -812,5 +812,54 @@ class TestItem8WeightDecayInteraction(unittest.TestCase):
         self.assertGreater(ratio, 0.0)
 
 
+@_skip_if_no_cuda
+class TestItem9InputIdsReachTheIndexerLossMask(unittest.TestCase):
+    """``input_ids`` must reach the MQA core attention, and only that one.
+
+    The indexer-loss row mask has to come from ``input_ids != pad_token_id``:
+    ``attn_mask_startend_row_indices`` folds a packed sequence's trailing
+    padding into the last document, so the document metadata alone reports those
+    rows as valid. ``MultiLatentAttention.forward`` therefore forwards
+    ``input_ids`` to ``core_attention`` -- but only under ``mqa_latent``, since
+    ``DotProductAttention.forward`` has no such parameter and no ``**kwargs``.
+    """
+
+    SEQ = 64
+
+    def test_mqa_core_attention_receives_input_ids(self):
+        if not _HAS_DSA:
+            self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
+        module = _build("mqa_dsa")
+        seen = {}
+        inner = module.core_attention.forward
+
+        def recording(*args, **kwargs):
+            seen["input_ids"] = kwargs.get("input_ids")
+            return inner(*args, **kwargs)
+
+        module.core_attention.forward = recording
+        module.eval()
+        input_ids = paddle.ones([1, self.SEQ], dtype="int64")
+        module(
+            _hidden(self.SEQ),
+            attention_mask=None,
+            attn_mask_startend_row_indices=_row_end(self.SEQ),
+            input_ids=input_ids,
+        )
+        self.assertIsNotNone(seen["input_ids"])
+        self.assertEqual(list(seen["input_ids"].shape), [1, self.SEQ])
+
+    def test_mha_core_attention_is_not_given_input_ids(self):
+        # Would raise TypeError if the kwarg were forwarded unconditionally.
+        module = _build("mha")
+        module.eval()
+        module(
+            _hidden(self.SEQ),
+            attention_mask=None,
+            attn_mask_startend_row_indices=_row_end(self.SEQ),
+            input_ids=paddle.ones([1, self.SEQ], dtype="int64"),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

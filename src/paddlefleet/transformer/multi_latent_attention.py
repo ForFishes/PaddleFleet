@@ -896,6 +896,14 @@ class MultiLatentAttention(Attention):
         layer_idx = kwargs.get("layer_idx")
         use_cache = kwargs.get("use_cache", False)
 
+        # The indexer-loss row mask needs ``input_ids``: the packed sequence's
+        # trailing padding is invisible to ``attn_mask_startend_row_indices``.
+        # Only the non-absorbed-MQA core attention accepts it (and only that one
+        # owns an indexer), so keep the kwarg off every other core attention.
+        core_attn_extra = {}
+        if self.mqa_latent and kwargs.get("input_ids") is not None:
+            core_attn_extra["input_ids"] = kwargs["input_ids"]
+
         if self.mqa_latent:
             # Query is already absorbed; the core attention only needs the V-side
             # de-absorption weight, laid out for
@@ -962,6 +970,7 @@ class MultiLatentAttention(Attention):
                 k_pos_emb=k_pos_emb,
                 q_absorbed=q_absorbed,
                 v_b_proj_weight=wv_b,
+                **core_attn_extra,
             )
         else:
             # Static batching attention kernel.
@@ -987,6 +996,7 @@ class MultiLatentAttention(Attention):
                 k_pos_emb=k_pos_emb,
                 q_absorbed=q_absorbed,
                 v_b_proj_weight=wv_b,
+                **core_attn_extra,
             )
 
         if self.recompute_qkv_up_porj_and_rope and self.training:

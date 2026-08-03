@@ -514,6 +514,130 @@ class TestMQADSA(unittest.TestCase):
             )
         self.assertIn("values", DSAIndexerLossLoggingHelper.tracker)
 
+    def test_indexer_loss_mask_comes_from_input_ids(self):
+        """Padding rows must not dilute the KL loss, and only ``input_ids`` sees them.
+
+        Same masked reduction and the same mask construction as
+        ``csa_attention.py:1302-1306`` / ``:2411-2443``. The document metadata
+        cannot stand in for it: ``attn_mask_startend_row_indices`` has no way to
+        say "these trailing rows are padding", so the tail here is folded into a
+        second document and every row reports ``is_valid == True``. Only
+        ``input_ids != pad_token_id`` separates them.
+
+        Two runs share the same 384-token document and differ only in how much
+        trailing padding follows it. With the mask both must report the same KL;
+        without it (a plain ``mean()``, or a mask derived from ``is_valid``) the
+        pad rows enter both numerator and denominator and the two diverge.
+        """
+        doc = 384  # > WINDOW, so later rows have a non-empty top-k set
+        query, key, w_v, x, qr = self._inputs(512, seed=3)
+
+        def run(seqlen):
+            DSAIndexerLossLoggingHelper.tracker.clear()
+            tensors = [t[:, :seqlen].clone() for t in (query, key, x, qr)]
+            for tensor in tensors:
+                tensor.stop_gradient = False
+            # 1 = real token, 0 = pad (``config.pad_token_id`` defaults to 0).
+            input_ids = paddle.concat(
+                [
+                    paddle.ones([1, doc], dtype="int64"),
+                    paddle.zeros([1, seqlen - doc], dtype="int64"),
+                ],
+                axis=-1,
+            )
+            self.module.train()
+            out = self.module(
+                tensors[0],
+                tensors[1],
+                None,
+                None,
+                _row_end([doc, seqlen - doc], seqlen),
+                v_b_proj_weight=w_v,
+                x=tensors[2],
+                qr=tensors[3],
+                input_ids=input_ids,
+            )
+            out.cast("float32").sum().backward()
+            return float(DSAIndexerLossLoggingHelper.tracker["values"][0])
+
+        loss_448, loss_512 = run(448), run(512)
+        self.assertGreater(loss_448, 0.0)
+        self.assertAlmostEqual(loss_512 / loss_448, 1.0, delta=2e-3)
+
+    def test_use_sparse_loss_widens_only_the_loss_topk(self):
+        """``dsa_indexer_use_sparse_loss`` picks the KL width, not attention's.
+
+        Same contract as the CSA layers of the same model
+        (``_resolve_csa_indexer_loss_topk_effective``): ``False`` scores a wider
+        candidate table so a fresh indexer is also supervised on columns it did
+        not pick, while attention keeps consuming ``window + index_topk``
+        unchanged. ``s=512`` widens the loss table 128 -> 512.
+
+        On this single full-length document neither the output bits nor the
+        index table are reproducible across identical calls: measured 2.4-2.8%
+        of the table's slots move between two *identical* eval-mode calls, and
+        ~1e-4 on the output. (Splitting the same 512 rows into two documents is
+        exactly reproducible, which is why
+        ``test_recompute_double_forward_is_consistent`` can assert equality --
+        it uses ``[200, 312]``.) So the loss width is asserted exactly -- it is
+        an integer the switch controls directly -- and the attention side is
+        asserted against that same-setting drift as a baseline. The failure
+        mode this rules out is prefix-truncating the wide table into attention,
+        which would move ~37% of the slots (the kernel emits ascending
+        *position* order, not score order).
+        """
+        seqlen = 512
+        query, key, w_v, x, qr = self._inputs(seqlen, seed=5)
+        loss_widths = []
+        inner_target = self.module._attn_target
+
+        def recording_target(query_, kv_, topk_indices):
+            loss_widths.append(int(topk_indices.shape[-1]))
+            return inner_target(query_, kv_, topk_indices)
+
+        self.module._attn_target = recording_target
+
+        def run(sparse):
+            _CAPTURED.clear()
+            DSAIndexerLossLoggingHelper.tracker.clear()
+            tensors = [t.clone() for t in (query, key, x, qr)]
+            for tensor in tensors:
+                tensor.stop_gradient = False
+            self.module.indexer_use_sparse_loss = sparse
+            self.module.train()
+            out = self.module(
+                tensors[0],
+                tensors[1],
+                None,
+                None,
+                _row_end([seqlen], seqlen),
+                v_b_proj_weight=w_v,
+                x=tensors[2],
+                qr=tensors[3],
+            )
+            out.cast("float32").sum().backward()
+            return (
+                _CAPTURED[-1].copy(),
+                float(DSAIndexerLossLoggingHelper.tracker["values"][0]),
+            )
+
+        idx_a, loss_sparse = run(True)
+        idx_b, _ = run(True)
+        idx_full, loss_full = run(False)
+
+        # Only the KL table widened; attention kept its own budget.
+        self.assertEqual(loss_widths, [INDEX_TOPK, INDEX_TOPK, seqlen])
+        for table in (idx_a, idx_b, idx_full):
+            self.assertEqual(int(table.shape[-1]), WINDOW + INDEX_TOPK)
+        baseline = float((idx_a != idx_b).mean())
+        cross = float((idx_full != idx_b).mean())
+        self.assertLess(cross, max(4 * baseline, 0.02))
+        self.assertGreater(loss_sparse, 0.0)
+        self.assertGreater(loss_full, 0.0)
+        # A wider renormalisation set means a different KL; equal values would
+        # mean the switch never reached the loss.
+        self.assertGreater(abs(loss_full - loss_sparse), 1e-6)
+
     def test_recompute_double_forward_is_consistent(self):
         """Reentrant recompute runs the layer twice: pass 1 under ``no_grad``.
 

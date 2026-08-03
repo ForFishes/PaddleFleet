@@ -1020,8 +1020,14 @@ class TransformerLayer(nn.Layer):
         )
 
         extra_kwargs = {}
+        # Both indexer-bearing attentions need ``input_ids`` to build the
+        # indexer-loss row mask: ``attn_mask_startend_row_indices`` cannot
+        # express the trailing padding of a packed sequence, so only
+        # ``input_ids != pad_token_id`` identifies the pad rows. The MLA branch
+        # forwards it on to its core attention only when that core is the
+        # non-absorbed-MQA one.
         if input_ids is not None and isinstance(
-            self.self_attn, DSv4HybridAttention
+            self.self_attn, (DSv4HybridAttention, MultiLatentAttention)
         ):
             extra_kwargs["input_ids"] = input_ids
         if "shared_kv" in kwargs:

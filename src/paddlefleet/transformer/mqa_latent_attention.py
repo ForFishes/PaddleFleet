@@ -21,7 +21,8 @@
 * ``true``  -- :class:`MQALatentAttention` with a forced local window plus
   Lightning-indexer top-k, i.e. DeepSeek Sparse Attention on the KV latent.
   The indexer reuses the model-wide ``index_n_heads`` / ``index_head_dim`` /
-  ``index_topk``.
+  ``index_topk``, and ``dsa_indexer_use_sparse_loss`` selects the indexer-loss
+  width exactly as it does for the CSA layers (see ``_forward_dsa``).
 
 ``MLASelfAttention`` performs the activation-level absorption (see its
 ``mqa_latent`` flag), so this module receives
@@ -74,10 +75,18 @@ from paddlefleet.transformer.layer import FleetLayer
 if TYPE_CHECKING:
     from paddlefleet.transformer.enums import AttnMaskType
 
-# Query-row chunk used when materialising the KL target on the selected set.
-# 128 rows x 512 slots x 576 dims is ~75MB of gathered bf16 keys, ~150MB more
-# for the fp32 copy the matmul runs on. Transient, freed every iteration.
-_TARGET_CHUNK = 128
+# Working set of the KL-target gather, as a ``rows x slots`` budget: 256 rows x
+# 512 slots x 576 dims is ~150MB of gathered bf16 keys, transient and freed every
+# iteration. Measured at s=8192/h=64/topk=512/dk=576 on one B30Z: 15.9ms at 128
+# rows, 13.3ms at 256, 12.4ms at 512, 12.4ms at 1024 -- past 256 the curve is
+# flat, so larger chunks only buy peak memory. Budgeting the product keeps that
+# working set when ``dsa_indexer_use_sparse_loss=False`` widens the table.
+_TARGET_ROW_SLOTS = 256 * 512
+# cuDNN indexer limits on the top-k table width: ``indexer_top_k/api.py:92``
+# rejects ``top_k > 2048`` outright, and ``indexer_backward_sm100.__init__``
+# asserts ``topk % block_I == 0`` with ``block_I = 128``.
+_LOSS_TOPK_CAP = 2048
+_TOPK_BLOCK = 128
 _NEG_INF = -1e30
 _EPS = 1e-10
 
@@ -152,6 +161,12 @@ class MQALatentAttention(FleetLayer):
         self.indexer_loss_coeff = float(
             getattr(config, "dsa_indexer_loss_coeff", 0.0) or 0.0
         )
+        # Same switch, same meaning as the CSA layers of the hybrid model: it
+        # selects the *width of the loss* top-k table, not the attention one.
+        # See ``_forward_dsa`` for how far it can be widened here.
+        self.indexer_use_sparse_loss = bool(
+            getattr(config, "dsa_indexer_use_sparse_loss", False)
+        )
         # Learnable per-head attention-sink logit, from the model-wide
         # ``add_full_attention_sink_bias`` / ``softmax_type``. Built by the same
         # helper ``DotProductAttention`` uses, so the state_dict name
@@ -187,6 +202,7 @@ class MQALatentAttention(FleetLayer):
         k_pos_emb: Tensor | None = None,
         q_absorbed: Tensor | None = None,
         v_b_proj_weight: Tensor | None = None,
+        input_ids: Tensor | None = None,
     ) -> Tensor:
         """Absorbed-MQA forward.
 
@@ -199,6 +215,9 @@ class MQALatentAttention(FleetLayer):
             x / qr: hidden states / q latent, inputs of the DSA indexer.
             v_b_proj_weight: ``[kv_lora_rank, h, v_head_dim]`` de-absorption
                 weight (the V slice of ``kv_b_proj``).
+            input_ids: ``[b, s]`` token ids, only used to build the indexer-loss
+                row mask (``!= pad_token_id``). ``None`` falls back to the plain
+                row mean, as CSA does at ``csa_attention.py:1306``.
 
         Returns:
             ``[b, s, h * v_head_dim]``
@@ -263,6 +282,7 @@ class MQALatentAttention(FleetLayer):
             is_valid,
             doc_lens,
             kv_lora_rank,
+            input_ids,
         )
 
     # ------------------------------------------------------------------
@@ -348,6 +368,7 @@ class MQALatentAttention(FleetLayer):
         is_valid,
         doc_lens,
         kv_lora_rank,
+        input_ids=None,
     ) -> Tensor:
         from paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn import (
             cudnn_indexer_topk_fwd,
@@ -356,8 +377,11 @@ class MQALatentAttention(FleetLayer):
         b, s = int(query.shape[0]), int(query.shape[1])
         # The indexer loss is only attached on the grad-enabled forward. Under
         # full-layer recompute the first forward runs under no_grad and must
-        # only materialise indices; the top-k is deterministic, so both forwards
-        # select the same columns.
+        # only materialise indices; both passes see identical inputs, so the
+        # top-k kernel reselects the same columns. (Its tie-break is not
+        # bit-stable in every shape -- one document spanning the whole sequence
+        # drifts by ~2% of the slots between identical calls -- but any residual
+        # drift only changes which columns the backward differentiates.)
         need_loss = (
             self.training
             and paddle.is_grad_enabled()
@@ -394,27 +418,63 @@ class MQALatentAttention(FleetLayer):
         # ``indexer_backward_sm100.__init__`` asserts ``topk % block_I == 0``
         # with ``block_I=128``. So keep the configured budget instead of
         # clamping it to the sequence length, which would break that assert.
-        topk_eff = int(self.indexer.index_topk)
+        attn_topk = int(self.indexer.index_topk)
+        # ``dsa_indexer_use_sparse_loss`` means here exactly what it means for
+        # the CSA layers of the same model
+        # (``_resolve_csa_indexer_loss_topk_effective``, csa_attention.py:1091):
+        # the indexer loss may score a *wider* table than attention consumes.
+        #   True  -> KL over exactly the set attention uses (selected-set KL).
+        #   False -> KL over the full candidate table, so a freshly initialised
+        #            indexer is supervised on columns it did not pick and cannot
+        #            reinforce its own initial ranking.
+        # CSA's "full" is its *compressed* candidate range (``s / ratio``, e.g.
+        # 64 columns at ratio 128). These layers are uncompressed, so the full
+        # range is the causal span itself and the cuDNN indexer bounds it at
+        # ``_LOSS_TOPK_CAP``: with s=8192 the loss covers the top 2048 scoring
+        # columns, not all 8192. Going truly dense would mean materialising the
+        # ``[s, h, s]`` attention distribution per layer -- the very thing this
+        # path exists to avoid -- so the cap stands.
+        loss_topk = attn_topk
+        if need_loss and not self.indexer_use_sparse_loss:
+            loss_topk = max(
+                attn_topk, min(_LOSS_TOPK_CAP, s // _TOPK_BLOCK * _TOPK_BLOCK)
+            )
         # The THD/varlen fast path builds ``cu_seqlens_k`` from ``doc_lens``,
         # i.e. it assumes a document-compacted K buffer. At ratio 1 the K buffer
         # is the raw token sequence, so the two only coincide when the documents
         # exactly tile the sequence; otherwise fall back to the dense path.
         doc_lens_arg = doc_lens.tolist() if int(doc_lens.sum()) == s else None
-        with paddle.no_grad():
-            topk_out = cudnn_indexer_topk_fwd(
+
+        def select_topk(width, want_scores):
+            out = cudnn_indexer_topk_fwd(
                 q_idx.detach(),
                 k_idx.detach(),
                 w_idx.detach(),
                 ratio=1,
-                topk_effective=topk_eff,
+                topk_effective=width,
                 valid_range=valid_range,
                 doc_lens=doc_lens_arg,
-                return_topk_scores=need_loss,
+                return_topk_scores=want_scores,
             )
-            topk_indices = topk_out[0]
-            topk_indices = paddle.where(
-                row_empty, paddle.full_like(topk_indices, -1), topk_indices
-            )
+            idx = paddle.where(row_empty, paddle.full_like(out[0], -1), out[0])
+            return idx, (out[2] if want_scores else None)
+
+        with paddle.no_grad():
+            # A wider table cannot be narrowed by slicing: the kernel emits the
+            # selected columns in ascending *position* order, not by score
+            # (measured: at s=512/topk=384 only 25% of the 128-wide table's
+            # entries match the wide table's first 128, and score steps go up
+            # 61290 times). So the two widths need two calls; the extra one runs
+            # only on the grad-enabled forward of a full-loss step.
+            #
+            # ``return_topk_scores`` stays tied to ``need_loss`` alone, never to
+            # the width decision: the flag selects a different kernel path and
+            # measurably changes which columns come back (~11% of slots at
+            # s=512/topk=128), so making it depend on the switch would move the
+            # attention set too. The scores of the narrow call are then unused
+            # when the loss widens the table.
+            topk_indices, attn_scores = select_topk(attn_topk, need_loss)
+            reuse_for_loss = loss_topk == attn_topk
             token_indices = paddle.concat(
                 [window_idxs, topk_indices], axis=-1
             ).contiguous()
@@ -428,21 +488,42 @@ class MQALatentAttention(FleetLayer):
             return output
 
         with paddle.no_grad():
-            valid = topk_indices >= 0
+            if reuse_for_loss:
+                loss_indices, loss_scores = topk_indices, attn_scores
+            else:
+                loss_indices, loss_scores = select_topk(loss_topk, True)
+            valid = loss_indices >= 0
             scores = paddle.where(
                 valid,
-                topk_out[2].cast("float32"),
-                paddle.full(topk_indices.shape, _NEG_INF, dtype="float32"),
+                loss_scores.cast("float32"),
+                paddle.full(loss_indices.shape, _NEG_INF, dtype="float32"),
             )
             topk_probs = F.softmax(scores, axis=-1)
             topk_probs = paddle.where(
                 valid, topk_probs, paddle.zeros_like(topk_probs)
             )
-            target = self._attn_target(query.detach(), kv, topk_indices)
+            target = self._attn_target(query.detach(), kv, loss_indices)
             kl = target * (
                 paddle.log(target + _EPS) - paddle.log(topk_probs + _EPS)
             )
-            loss = kl.sum(axis=-1).mean() * self.indexer_loss_coeff
+            # Masked reduction, same as csa_attention.py:1302-1306, over the same
+            # row mask csa_attention.py:2411-2443 builds. It has to come from
+            # ``input_ids``, not from the document metadata: a packed sequence's
+            # trailing padding is folded into the last document's row range, so
+            # ``attn_mask_startend_row_indices`` -- and therefore ``is_valid`` --
+            # still marks those rows valid. ``input_ids != pad_token_id`` is the
+            # backstop that catches them, keeping the padding out of both the
+            # logged loss and the gradient denominator.
+            loss_mask, valid_rows = self._indexer_loss_mask(input_ids, b, s)
+            kl_per_pos = kl.sum(axis=-1)
+            if loss_mask is None:
+                loss = kl_per_pos.mean() * self.indexer_loss_coeff
+            else:
+                loss = (
+                    (kl_per_pos * loss_mask).sum()
+                    / valid_rows
+                    * self.indexer_loss_coeff
+                )
 
         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
             loss=loss,
@@ -456,20 +537,51 @@ class MQALatentAttention(FleetLayer):
             q_idx,
             w_idx,
             k_idx,
-            topk_indices,
+            loss_indices,
             topk_probs,
             target,
             self.indexer_loss_coeff,
             "cudnn",
+            # ``num_rows_override`` + ``loss_mask``: the backward zeroes the pad
+            # rows and rescales the cuDNN kernel's built-in ``1/(B*Sq)`` into
+            # ``1/valid_rows``, matching the forward reduction above. Both
+            # ``None`` (no ``input_ids``) leaves the kernel's own mean in place.
+            valid_rows,
+            loss_mask,
         )
+
+    def _indexer_loss_mask(self, input_ids, b, s):
+        """``([b, s] float32 row mask, its row count)`` from ``input_ids``.
+
+        ``(None, None)`` when no ``input_ids`` reached this layer (inference and
+        the direct-construction unit tests), which keeps the plain row mean.
+        Context parallel needs no branch here: ``forward`` rejects it outright.
+        """
+        if input_ids is None:
+            return None, None
+        pad_token_id = getattr(self.config, "pad_token_id", 0)
+        assert pad_token_id is not None, (
+            "pad_token_id must be set in config when input_ids is provided"
+        )
+        loss_mask = (input_ids.reshape([b, s]) != pad_token_id).astype(
+            paddle.float32
+        )
+        return loss_mask, max(float(loss_mask.sum()), 1.0)
 
     def _attn_target(self, query, kv, topk_indices) -> Tensor:
         """KL target: head-summed attention probs restricted to the top-k set.
 
         The tilelang ``csa_attn_target_reducesum`` kernel requires a
         power-of-two head dim, which the 576-wide latent is not, and the dense
-        ``_compute_attn_target_on_selected_set`` materialises ``[b, h, s, s]``.
-        So gather the selected keys in query-row chunks instead.
+        ``_compute_attn_target_on_selected_set`` materialises ``[b, h, s, s]``
+        (16x the FLOPs at ``s=8192, topk=512``). So gather the selected keys in
+        query-row chunks instead: ``s*h*topk*dk`` MACs, no ``s*s`` tensor.
+
+        The matmul runs in the input dtype (bf16) with fp32 accumulation, which
+        is what the tilelang kernel does internally for the CSA layers; only the
+        softmax and the L1 normalisation are fp32. The chunk height follows
+        ``_TARGET_ROW_SLOTS / topk``, so the gather buffer stays the same size
+        whether the table is the attention one or the wider loss one.
 
         Args:
             query: ``[1, s, h, dk]`` detached absorbed query.
@@ -481,24 +593,20 @@ class MQALatentAttention(FleetLayer):
         """
         s, topk = int(query.shape[1]), int(topk_indices.shape[-1])
         dk = int(query.shape[-1])
+        chunk = max(1, _TARGET_ROW_SLOTS // topk)
         q0, kv0, idx0 = query[0], kv[0], topk_indices[0]
         parts = []
-        for start in range(0, s, _TARGET_CHUNK):
-            end = min(start + _TARGET_CHUNK, s)
+        for start in range(0, s, chunk):
+            end = min(start + chunk, s)
             idx_c = idx0[start:end].cast("int64")
             valid = idx_c >= 0
             safe = paddle.where(valid, idx_c, paddle.zeros_like(idx_c))
             k_sel = paddle.gather(kv0, safe.flatten(), axis=0).reshape(
                 [end - start, topk, dk]
             )
-            # fp32 *before* the matmul, matching the reference target
-            # (``_compute_attn_target_on_selected_set``); a bf16 matmul here
-            # perturbs the KL target by ~1e-4.
             scores = (
-                paddle.matmul(
-                    q0[start:end].cast("float32"),
-                    k_sel.cast("float32"),
-                    transpose_y=True,
+                paddle.matmul(q0[start:end], k_sel, transpose_y=True).cast(
+                    "float32"
                 )
                 * self.softmax_scale
             )
