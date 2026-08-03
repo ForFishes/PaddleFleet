@@ -385,6 +385,40 @@ class TestItem1StateDictAndGradientMatch(unittest.TestCase):
                 got, ref, err_msg=f"{name} changed on load"
             )
 
+    def test_mqa_consumes_mha_state_dict_when_sink_is_enabled_together(self):
+        """The production migration flips TWO json fields at once.
+
+        ``ernielite_layer43_mla_hca`` -> ``..._non_absorbed_mqa_hca_dsa`` adds
+        ``non_absorbed_mqa: true`` *and* ``add_full_attention_sink_bias: true``,
+        so the phase-1 checkpoint has no ``softmax_offset`` at all. The test
+        above builds both phases with the sink already on; this one covers the
+        real delta: the newly initialised set must be exactly the indexer's
+        weights plus the one sink vector, with nothing dropped or renamed, which
+        is what makes the phase-1 checkpoint loadable with no conversion step.
+        """
+        mha = _build("mha", sink=False)
+        mqa = _build("mqa", sink=True)
+        mha_sd = mha.state_dict()
+        mha_keys, mqa_keys = set(mha_sd), set(mqa.state_dict())
+        self.assertEqual(
+            mha_keys - mqa_keys, set(), "mqa dropped an mha parameter name"
+        )
+        extra = mqa_keys - mha_keys
+        sink = {k for k in extra if k.endswith("softmax_offset")}
+        self.assertEqual(len(sink), 1, f"expected one sink, got {sorted(sink)}")
+        self.assertTrue(
+            all("indexer" in k for k in extra - sink),
+            f"mqa added non-indexer, non-sink keys: {sorted(extra - sink)}",
+        )
+        mqa.set_state_dict(mha_sd)
+        reloaded = mqa.state_dict()
+        for name in mha_sd:
+            np.testing.assert_array_equal(
+                reloaded[name].astype("float32").numpy(),
+                mha_sd[name].astype("float32").numpy(),
+                err_msg=f"{name} changed on load",
+            )
+
     def test_per_param_gradient_match_mqa_vs_mha(self):
         if not _HAS_DSA:
             self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
@@ -438,10 +472,14 @@ class TestItem2AbsoluteMagnitudeSanity(unittest.TestCase):
         a = o_mha.numpy()
         b = o_mqa.numpy()
         rel = _rel_err(b, a)
-        # If the softmax scale were dropped/doubled, or the einsum lost a
-        # 1/sqrt(d), the outputs would differ by >> bf16 noise.
+        # Measured 3.96e-3 .. 4.05e-3 over seeds 0/3/7 at seq 128 -- the two
+        # kernels (dense flashmask vs FlashMLA sparse) accumulate bf16 in a
+        # different order; each is bit-reproducible against itself (self rel
+        # 0.0). The bound leaves ~2.5x headroom over that floor. If the softmax
+        # scale were dropped/doubled, or the einsum lost a 1/sqrt(d), the
+        # outputs would differ by orders of magnitude more.
         self.assertLess(
-            rel, 5e-2, "mqa forward diverges from mha -> scale/einsum bug"
+            rel, 1e-2, "mqa forward diverges from mha -> scale/einsum bug"
         )
 
     def test_grad_norm_ratio_not_on_a_suspicious_constant(self):
