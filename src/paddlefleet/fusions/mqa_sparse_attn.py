@@ -39,8 +39,6 @@ gather branch (``paddlefleet.cudnn_ops.block_sparse_mqa_dsa``), which expands
 its selected block ids into token columns first.
 """
 
-import os
-
 import paddle
 
 # FlashMLA's sparse prefill fixes the query-head count on SM100.
@@ -220,18 +218,14 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
         # KV-only ``lse`` (it re-derives lse_full from it).
         lse_bwd = lse
         sink_bwd = sink
-        # [ablation gate] HYSPARSE_DSA_FINITE_SINK_FIX=0 disables the finite-sink
-        # LSE correction to reproduce the exact online (v2) DSA backward behavior
-        # (KV-only LSE fed verbatim). Default on (=1). Root-cause confirmation only.
-        #
-        # This gate is load-bearing and silent: turning it off leaves the forward
-        # output bit-identical (it only touches the backward), while ``dq`` gets
-        # ~75x and ``dkv`` ~120x worse against an autograd reference. Do not use
-        # forward agreement to conclude the backward is fine.
-        _dsa_finite_sink_fix = (
-            os.environ.get("HYSPARSE_DSA_FINITE_SINK_FIX", "1") != "0"
-        )
-        if _dsa_finite_sink_fix and ctx.learnable_sink and dk != d_v:
+        # This correction is load-bearing and silent: dropping it leaves the
+        # forward output bit-identical (it only touches the backward), while
+        # ``dq`` gets ~75x and ``dkv`` ~120x worse against an autograd
+        # reference. Do not use forward agreement to conclude the backward is
+        # fine. See ``tests/.../test_block_sparse_dsa_gradcheck.py::
+        # test_finite_sink_lse_fix_matters``, which re-drives the raw kernels
+        # with the uncorrected KV-only LSE to pin the gap.
+        if ctx.learnable_sink and dk != d_v:
             lse_bwd = paddle.logaddexp(
                 lse.astype("float32"),
                 sink.astype("float32").reshape([1, 1, hpad]),

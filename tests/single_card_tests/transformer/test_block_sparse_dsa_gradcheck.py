@@ -37,19 +37,21 @@ in :class:`TestDtypeBehaviour`), so q/kv error floors are bf16-limited
 justified against the measured bf16 round-off floor (:meth:`_bf16_floor`).
 """
 
-import os
 import unittest
 
 import numpy as np
 import paddle
 
 from paddlefleet.cudnn_ops.block_sparse_mqa_dsa import is_dsa_available
-from paddlefleet.fusions.mqa_sparse_attn import _NEG_SINK, mqa_sparse_attn
+from paddlefleet.fusions.mqa_sparse_attn import (
+    _DSA_HEADS,
+    _NEG_SINK,
+    mqa_sparse_attn,
+)
 
 DK = 576  # absorbed-MQA query/key width (kv_lora_rank 512 + qk_rope 64)
 DV = 512  # value width == leading 512 dims of the shared latent
 SM = DK**-0.5
-_FIX_ENV = "HYSPARSE_DSA_FINITE_SINK_FIX"
 
 
 def _kernels_available():
@@ -236,6 +238,68 @@ def _kernel_grads(
     return dq, dkv, dsink
 
 
+def _kernel_dq_with_kv_only_lse(q_np, kv_np, ti_np, dO_np, sink_mag):
+    """dQ from the raw kernels with the **uncorrected** KV-only LSE.
+
+    ``mqa_sparse_attn`` always folds the sink into the LSE it hands the cuDNN
+    DSA backward, because that kernel's ``d_qk != d_v`` branch consumes the LSE
+    verbatim. This helper drives the same kernel pair directly and skips the
+    fold, so a test can measure what the correction is worth without the layer
+    needing a switch for it.
+    """
+    from paddlefleet.cudnn_ops import csa_sparse_attn_bwd_cudnn
+    from paddlefleet.cudnn_ops.attn.csa_sparse_attn_fwd_cudnn import (
+        flash_mla_sparse_attn,
+    )
+    from paddlefleet.fusions.csa_sparse_attn import _csa_compute_topk_length
+    from paddlefleet.fusions.csa_sparse_attn_utils import _local_to_global_flat
+
+    b, s, H, _ = q_np.shape
+    skv = kv_np.shape[1]
+    hp = _DSA_HEADS
+    qb, kvb = _to_bf16(q_np), _to_bf16(kv_np)
+    q_pad = paddle.concat(
+        [qb, paddle.zeros([b, s, hp - H, DK], dtype=qb.dtype)], axis=2
+    )
+    sink = paddle.concat(
+        [
+            paddle.full([H], float(sink_mag), dtype="float32"),
+            paddle.full([hp - H], _NEG_SINK, dtype="float32"),
+        ]
+    )
+    ti = paddle.to_tensor(ti_np)
+    tl = _csa_compute_topk_length(ti.reshape([b * s, -1]))
+    out, lse, _ = flash_mla_sparse_attn(
+        q_pad,
+        kvb,
+        sink,
+        ti,
+        sm_scale=float(SM),
+        d_v=DV,
+        topk_length=tl.reshape([b, s]),
+    )
+    do = paddle.concat(
+        [
+            paddle.to_tensor(dO_np.reshape([b, s, H, DV])).cast(out.dtype),
+            paddle.zeros([b, s, hp - H, DV], dtype=out.dtype),
+        ],
+        axis=2,
+    ).contiguous()
+    dq, _, _ = csa_sparse_attn_bwd_cudnn(
+        q_pad.reshape([b * s, hp, DK]),
+        kvb.reshape([b * skv, DK]),
+        out.reshape([b * s, hp, DV]),
+        do.reshape([b * s, hp, DV]),
+        lse.reshape([b * s, hp]),  # KV-only: the sink is NOT folded in
+        sink,
+        _local_to_global_flat(ti, skv),
+        softmax_scale=float(SM),
+        topk_length=tl,
+    )
+    dq = dq.reshape([b, s, hp, DK])[:, :, :H, :]
+    return dq.cast("float32").numpy()[0]
+
+
 class _Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -244,10 +308,6 @@ class _Base(unittest.TestCase):
             paddle.set_flags({"FLAGS_cudnn_deterministic": True})
         except Exception:
             pass
-
-    def setUp(self):
-        # The finite-sink LSE fix defaults ON; force it unless a test flips it.
-        os.environ[_FIX_ENV] = "1"
 
 
 # ===========================================================================
@@ -478,22 +538,23 @@ class TestSinkSpecifics(_Base):
         self.assertEqual(agree, 1.0)
 
     def test_finite_sink_lse_fix_matters(self):
-        """dk(576) != d_v(512): FIX=1 must be far closer to the reference."""
+        """dk(576) != d_v(512): the finite-sink LSE fold is load-bearing.
+
+        The layer always folds the sink into the LSE it passes the backward;
+        driving the same kernels with the raw KV-only LSE must be far worse.
+        """
         H, s = 8, 64
         q = _rand([1, s, H, DK], 0.3, 91)
         kv = _rand([1, s, DK], 0.3, 92)
         ti = _causal_indices(s, 128, seed=93)
         dO = _rand([1, s, H * DV], 1.0, 94)
         rq, _, _ = _analytic_ref_grads(q, kv, ti, dO, 3.0)
-        res = {}
-        for fix in ("1", "0"):
-            os.environ[_FIX_ENV] = fix
-            kq, _, _ = _kernel_grads(q, kv, ti, dO, 3.0)
-            res[fix] = _relerr(kq, rq)
-        os.environ[_FIX_ENV] = "1"
-        self.assertLess(res["1"], 1e-2)
-        self.assertGreater(res["0"], 0.5)
-        self.assertLess(res["1"], res["0"] * 0.05)
+        folded, _, _ = _kernel_grads(q, kv, ti, dO, 3.0)
+        raw = _kernel_dq_with_kv_only_lse(q, kv, ti, dO, 3.0)
+        e_folded, e_raw = _relerr(folded, rq), _relerr(raw, rq)
+        self.assertLess(e_folded, 1e-2)
+        self.assertGreater(e_raw, 0.5)
+        self.assertLess(e_folded, e_raw * 0.05)
 
 
 # ===========================================================================
