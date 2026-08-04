@@ -24,6 +24,11 @@
   ``index_topk``, and ``dsa_indexer_use_sparse_loss`` selects the indexer-loss
   width exactly as it does for the CSA layers (see ``_forward_dsa``).
 
+``non_absorbed_mqa_dense`` additionally drops the indexer and attends to the full
+per-document causal set, which is mathematically identical to the dense MHA phase;
+it isolates the absorption from the sparsity for equivalence experiments and is
+``O(s^2)`` in index memory, so it is not a production mode.
+
 ``MLASelfAttention`` performs the activation-level absorption (see its
 ``mqa_latent`` flag), so this module receives
 
@@ -96,9 +101,10 @@ class MQALatentAttentionSublayersSpec:
     """Sublayers spec for :class:`MQALatentAttention`.
 
     Args:
-        indexer: ``DSAIndexer`` spec. ``non_absorbed_mqa`` always provides one;
-            ``None`` (dense per-document causal attention, mathematically equal
-            to MHA) exists only for the absorption equivalence unit tests.
+        indexer: ``DSAIndexer`` spec. ``non_absorbed_mqa`` provides one unless
+            ``non_absorbed_mqa_dense`` is set, in which case it is ``None`` and
+            the layer attends to the full per-document causal set (dense MHA
+            equivalent). Also ``None`` in the absorption equivalence unit tests.
     """
 
     indexer: LayerSpec | type = None
@@ -261,8 +267,9 @@ class MQALatentAttention(FleetLayer):
             )
 
         if self.indexer is None:
-            # Absorption-equivalence path (unit tests only): per-document full
-            # causal attention, mathematically identical to dense MHA.
+            # ``non_absorbed_mqa_dense`` (and the absorption-equivalence unit
+            # tests): per-document full causal attention, mathematically
+            # identical to dense MHA.
             token_indices = self._build_full_causal_indices(
                 b, s, doc_start, is_valid
             )

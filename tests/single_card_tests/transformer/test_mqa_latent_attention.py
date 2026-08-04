@@ -280,6 +280,20 @@ class TestHybridMLAConfig(unittest.TestCase):
                 **self._non_absorbed_kwargs(dsa_index_n_heads=None)
             )
 
+    def test_dense_switch_alone_is_rejected(self):
+        # ``non_absorbed_mqa_dense`` replaces that mode's indexer, so on its own
+        # it would be a silent no-op. Must be a config error instead.
+        with self.assertRaisesRegex(ValueError, "non_absorbed_mqa_dense"):
+            TransformerConfig(**self._kwargs(non_absorbed_mqa_dense=True))
+
+    def test_dense_switch_does_not_require_index_dims(self):
+        # No indexer is built, so the index_* validation must be skipped -- these
+        # kwargs deliberately omit dsa_index_* and would otherwise be rejected.
+        config = TransformerConfig(
+            **self._kwargs(non_absorbed_mqa=True, non_absorbed_mqa_dense=True)
+        )
+        self.assertTrue(config.non_absorbed_mqa_dense)
+
     def test_index_dims_unvalidated_when_non_absorbed_mqa_off(self):
         # With the flag off the -2 layers are dense MHA; the indexer fields are
         # unused and left at their defaults without triggering the validation.
@@ -317,7 +331,9 @@ class TestMQAEquivalence(unittest.TestCase):
 
     def test_single_document_matches_dense(self):
         out, ref = self._run(256, None)
-        self.assertLess(_rel(out, ref), 5e-3)
+        # W7 measured _rel 2.20e-3..2.63e-3 over seeds 0-4 (bf16, cudnn
+        # deterministic); tightened 5e-3 -> 3.5e-3 (1.3x headroom over worst).
+        self.assertLess(_rel(out, ref), 3.5e-3)
 
     def test_multi_document_layouts_match_dense(self):
         seqlen = 256
@@ -325,7 +341,9 @@ class TestMQAEquivalence(unittest.TestCase):
             with self.subTest(layout=layout):
                 _CAPTURED.clear()
                 out, ref = self._run(seqlen, layout)
-                self.assertLess(_rel(out, ref), 5e-3)
+                # W7 measured max _rel 2.63e-3 over 10 layouts x seeds 0-4;
+                # tightened 5e-3 -> 3.5e-3.
+                self.assertLess(_rel(out, ref), 3.5e-3)
                 _check_index_invariants(
                     self,
                     _CAPTURED[-1],
@@ -382,13 +400,16 @@ class TestMQAEquivalence(unittest.TestCase):
         ref = _dense_reference(
             query, key, w_v, row_end, module.softmax_scale, sink=sink_used
         )
-        self.assertLess(_rel(out, ref), 5e-3)
+        # W7 measured _rel 2.74e-3 over seeds 0-2 (dense + sink); 5e-3 -> 3.5e-3.
+        self.assertLess(_rel(out, ref), 3.5e-3)
         # ... and the sink genuinely changed the result: a positive logit drains
         # probability mass, so the sinkless reference is far away.
         sinkless = _dense_reference(
             query, key, w_v, row_end, module.softmax_scale
         )
-        self.assertGreater(_rel(sinkless, ref), 5e-2)
+        # W7 measured sinkless _rel ~0.985-1.02 (the sink dominates this layout);
+        # lower-bound tightened 5e-2 -> 0.5 (2x headroom below worst observed).
+        self.assertGreater(_rel(sinkless, ref), 0.5)
 
 
 @_GPU
@@ -453,7 +474,9 @@ class TestMQADSA(unittest.TestCase):
                 ref = _dense_reference(
                     query, key, w_v, row_end, self.module.softmax_scale
                 )
-                self.assertLess(_rel(out, ref), 5e-3)
+                # W7 measured max _rel 2.62e-3 over 3 layouts x seeds 0-2
+                # (DSA saturated budget); 5e-3 -> 3.5e-3.
+                self.assertLess(_rel(out, ref), 3.5e-3)
                 self.assertEqual(_CAPTURED[-1].shape[-1], WINDOW + INDEX_TOPK)
                 _check_index_invariants(
                     self, _CAPTURED[-1], row_end, seqlen, expect_full=True
@@ -562,7 +585,9 @@ class TestMQADSA(unittest.TestCase):
 
         loss_448, loss_512 = run(448), run(512)
         self.assertGreater(loss_448, 0.0)
-        self.assertAlmostEqual(loss_512 / loss_448, 1.0, delta=2e-3)
+        # W7 measured loss_512/loss_448 - 1 == 0.0 exactly over seeds
+        # 0/3/4/7/11 (two-doc layout is bit-reproducible); delta 2e-3 -> 5e-4.
+        self.assertAlmostEqual(loss_512 / loss_448, 1.0, delta=5e-4)
 
     def test_use_sparse_loss_widens_only_the_loss_topk(self):
         """``dsa_indexer_use_sparse_loss`` picks the KL width, not attention's.
@@ -631,7 +656,11 @@ class TestMQADSA(unittest.TestCase):
             self.assertEqual(int(table.shape[-1]), WINDOW + INDEX_TOPK)
         baseline = float((idx_a != idx_b).mean())
         cross = float((idx_full != idx_b).mean())
-        self.assertLess(cross, max(4 * baseline, 0.02))
+        # W7 measured cross/baseline ~0.90-1.02 over 3 trials (cross tracks the
+        # identical-call drift), while the failure it guards -- prefix-truncating
+        # the wide loss table into attention -- moves ~37% of slots. 4x -> 3x
+        # still cleanly separates ~2.7% (pass) from 37% (fail).
+        self.assertLess(cross, max(3 * baseline, 0.02))
         self.assertGreater(loss_sparse, 0.0)
         self.assertGreater(loss_full, 0.0)
         # A wider renormalisation set means a different KL; equal values would
@@ -699,11 +728,14 @@ class TestMQADSA(unittest.TestCase):
         ref = _dense_reference(
             query, key, w_v, row_end, module.softmax_scale, sink=sink_used
         )
-        self.assertLess(_rel(out, ref), 5e-3)
+        # W7 measured _rel 2.75e-3 over seeds 0-1 (DSA + finite-sink LSE
+        # correction, saturated budget); 5e-3 -> 3.5e-3.
+        self.assertLess(_rel(out, ref), 3.5e-3)
         sinkless = _dense_reference(
             query, key, w_v, row_end, module.softmax_scale
         )
-        self.assertGreater(_rel(sinkless, ref), 5e-2)
+        # W7 measured sinkless _rel ~0.985; lower-bound 5e-2 -> 0.5.
+        self.assertGreater(_rel(sinkless, ref), 0.5)
 
     def test_sink_receives_finite_nonzero_fp32_gradient(self):
         """The sink gradient is computed analytically (the kernel returns 0)."""

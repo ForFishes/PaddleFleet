@@ -899,5 +899,125 @@ class TestItem9InputIdsReachTheIndexerLossMask(unittest.TestCase):
         )
 
 
+class TestItem10IndexerKLValueAndDenominator(unittest.TestCase):
+    """The indexer KL scalar and its reduction denominator, at production settings.
+
+    Item 9 pins that ``input_ids`` reaches the layer; the existing width tests
+    pin the loss-table width. Neither pins the *numeric value* of the forward
+    indexer KL nor that its reduction denominator is the number of non-pad
+    tokens (``input_ids != pad_token_id``) rather than ``B*Sq``. Production runs
+    ``dsa_indexer_use_sparse_loss=False`` and ``dsa_indexer_loss_coeff=0.01``
+    with packed sequences whose tail is padding, so this fixes that path:
+
+      * the logged KL equals an independent fp32 recomputation from the same
+        (topk_probs, target, row-mask) the layer used, to < 1e-4;
+      * the reduction denominator (``num_rows_override`` handed to the backward)
+        equals the non-pad token count, so forward and backward agree exactly;
+      * the coefficient is applied exactly once (linear in coeff).
+    """
+
+    SEQ = 256
+    NPAD = 48  # trailing padding folded into the last document's row range
+
+    def _run_and_capture(self, coeff):
+        import paddlefleet.transformer.mqa_latent_attention as mqamod
+        from paddlefleet.transformer.dsa_attention import (
+            DSAIndexerLossLoggingHelper as LOG,
+        )
+
+        cap = {}
+        real = mqamod.TileLangCSAIndexerLossAutoScaler
+
+        class Spy:
+            @staticmethod
+            def apply(
+                output,
+                index_q,
+                weights,
+                index_k_comp,
+                topk_indices,
+                topk_probs,
+                target,
+                loss_coeff,
+                backend="tilelang",
+                num_rows_override=None,
+                loss_mask=None,
+            ):
+                cap["probs"] = topk_probs.detach().astype("float32").numpy()
+                cap["target"] = target.detach().astype("float32").numpy()
+                cap["mask"] = (
+                    None
+                    if loss_mask is None
+                    else loss_mask.detach().astype("float32").numpy()
+                )
+                cap["num_rows"] = (
+                    None
+                    if num_rows_override is None
+                    else float(num_rows_override)
+                )
+                cap["coeff"] = float(loss_coeff)
+                return real.apply(
+                    output,
+                    index_q,
+                    weights,
+                    index_k_comp,
+                    topk_indices,
+                    topk_probs,
+                    target,
+                    loss_coeff,
+                    backend,
+                    num_rows_override,
+                    loss_mask,
+                )
+
+        module = _build("mqa_dsa")
+        module.core_attention.indexer_loss_coeff = float(coeff)
+        module.core_attention.indexer_use_sparse_loss = False
+        module.train()
+        ids = np.ones((1, self.SEQ), dtype="int64")
+        ids[0, self.SEQ - self.NPAD :] = 0  # pad_token_id == 0
+        input_ids = paddle.to_tensor(ids)
+        mqamod.TileLangCSAIndexerLossAutoScaler = Spy
+        LOG.clean_loss_in_tracker()
+        try:
+            module(
+                _hidden(self.SEQ),
+                attention_mask=None,
+                attn_mask_startend_row_indices=_row_end(
+                    self.SEQ, doc_lens=[self.SEQ]
+                ),
+                input_ids=input_ids,
+            )
+        finally:
+            mqamod.TileLangCSAIndexerLossAutoScaler = real
+        logged = float(LOG.tracker["values"].astype("float32").sum())
+        return logged, cap
+
+    def test_kl_value_denominator_and_coeff(self):
+        if not _HAS_DSA:
+            self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
+        logged, cap = self._run_and_capture(coeff=0.01)
+        nonpad = float(self.SEQ - self.NPAD)
+
+        # denominator is the non-pad token count, shared with the backward.
+        self.assertIsNotNone(cap["mask"])
+        self.assertEqual(float(cap["mask"].sum()), nonpad)
+        self.assertEqual(cap["num_rows"], nonpad)
+
+        # loss-table width is widened (sparse_loss=False) beyond attn top-k 128.
+        self.assertGreater(cap["target"].shape[-1], 128)
+
+        # independent fp32 recomputation of the masked KL mean.
+        t, p = cap["target"], cap["probs"]
+        eps = 1e-10
+        kl_per_pos = (t * (np.log(t + eps) - np.log(p + eps))).sum(axis=-1)
+        ref = (kl_per_pos * cap["mask"]).sum() / nonpad * cap["coeff"]
+        self.assertLess(abs(logged - ref) / max(abs(ref), 1e-12), 1e-4)
+
+        # coefficient applied exactly once: 10x coeff -> ~10x logged KL.
+        logged10, _ = self._run_and_capture(coeff=0.1)
+        self.assertAlmostEqual(logged10 / logged, 10.0, delta=0.05)
+
+
 if __name__ == "__main__":
     unittest.main()

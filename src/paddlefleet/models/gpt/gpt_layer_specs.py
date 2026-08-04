@@ -342,20 +342,27 @@ def get_attention_spec(
         if non_absorbed_mqa:
             # Non-absorbed MQA core attention on the KV latent; parameters stay
             # byte-identical to MHA so an MHA checkpoint loads unchanged. The
-            # DSA indexer is what makes this mode worth running, so it is not
-            # separately switchable.
+            # DSA indexer is what makes this mode worth running, so it is only
+            # switchable off by ``non_absorbed_mqa_dense``, which attends to the
+            # full per-document causal set instead -- mathematically identical
+            # to the dense MHA phase, for isolating absorption from sparsity.
+            dense_mqa = getattr(config, "non_absorbed_mqa_dense", False)
             core_attention = LayerSpec(
                 layer=MQALatentAttention,
                 sublayers_spec=MQALatentAttentionSublayersSpec(
-                    indexer=LayerSpec(
-                        layer=DSAIndexer,
-                        sublayers_spec=DSAIndexerSublayersSpec(
-                            linear_wq_b=backend.linear(),
-                            linear_wk=backend.linear(),
-                            k_norm=paddle.nn.LayerNorm,
-                            linear_weights_proj=backend.linear(),
-                        ),
-                        extra_kwargs={"is_hybrid_mla_indexer": True},
+                    indexer=(
+                        None
+                        if dense_mqa
+                        else LayerSpec(
+                            layer=DSAIndexer,
+                            sublayers_spec=DSAIndexerSublayersSpec(
+                                linear_wq_b=backend.linear(),
+                                linear_wk=backend.linear(),
+                                k_norm=paddle.nn.LayerNorm,
+                                linear_weights_proj=backend.linear(),
+                            ),
+                            extra_kwargs={"is_hybrid_mla_indexer": True},
+                        )
                     ),
                 ),
             )

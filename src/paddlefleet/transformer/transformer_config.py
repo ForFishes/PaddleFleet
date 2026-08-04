@@ -848,6 +848,20 @@ class TransformerConfig(ModelParallelConfig):
     ``add_full_attention_sink_bias``. No hybrid-specific duplicates.
     """
 
+    non_absorbed_mqa_dense: bool = False
+    """Drop the DSA indexer from ``non_absorbed_mqa`` and attend to the full
+    per-document causal set instead. Requires ``non_absorbed_mqa=True``.
+
+    This exists to isolate the absorption from the sparsity: because absorption
+    is activation-level and exact, non-absorbed MQA over the *full* causal set is
+    mathematically identical to the dense MHA phase, so a warm-started run must
+    track the MHA run to within kernel noise. Any drift is then attributable to
+    the absorption or the softmax scale rather than to the top-k selection.
+
+    Not for production: the index table is ``[b, s, s]`` int32, so cost grows with
+    the square of the sequence length (268 MB per layer at ``s=8192``).
+    """
+
     v_head_dim: int | None = None
     """Dimension of the head in the V projection."""
 
@@ -1488,7 +1502,13 @@ class TransformerConfig(ModelParallelConfig):
                         "hybrid MLA dimensions must be explicit positive integers; "
                         f"invalid fields: {', '.join(invalid)}"
                     )
-                if self.non_absorbed_mqa:
+                if self.non_absorbed_mqa_dense and not self.non_absorbed_mqa:
+                    raise ValueError(
+                        "non_absorbed_mqa_dense=True only means anything with "
+                        "non_absorbed_mqa=True; it replaces that mode's DSA "
+                        "indexer with the full per-document causal set."
+                    )
+                if self.non_absorbed_mqa and not self.non_absorbed_mqa_dense:
                     # The -2 layers' indexer reuses the CSA indexer fields. The
                     # cuDNN indexer forward requires D_i=128, its backward
                     # asserts topk % block_I == 0 with block_I=128, and

@@ -284,6 +284,42 @@ class TestDeriveDocBoundariesAttack(unittest.TestCase):
         ds, dl, iv, dlens, _ = self._derive(_mask([10] * 8, 8), 8)
         self.assertEqual(dlens.numpy().tolist(), [10])  # > seqlen, unvalidated
 
+    def test_negative_endpoint_produces_negative_doc_len(self):
+        """FINDING (W2, extends A4-2): a NEGATIVE row_end is accepted and yields
+        a negative ``doc_len``.
+
+        ``_validate_csa_docmask_shape`` checks shape only -- never dtype, upper
+        bound, or lower bound -- so a mask of all ``-5`` passes shape validation
+        and ``doc_len = mask - doc_start`` becomes ``-5``. It does not corrupt a
+        real run (every row is then ``is_valid == False`` -> the MQA forward
+        emits an all-zero output, no cross-doc leak, no crash), but the emitted
+        metadata is silently wrong. A4's random sweep only covered well-formed
+        monotonic masks, which never go negative; this is the adversarial
+        counter-example. Production ``_pack_dsv4_logical_batch`` never emits a
+        negative endpoint, so this is a LOW hardening gap, not a live bug.
+        """
+        ds, dl, iv, dlens, _ = self._derive(_mask([-5] * 8, 8), 8)
+        self.assertFalse(
+            bool(iv.any()), "negative-end mask must select nothing"
+        )
+        self.assertEqual(dlens.numpy().tolist(), [-5])  # negative, unvalidated
+
+    def test_float_dtype_mask_is_silently_cast(self):
+        """FINDING (W2): a float32 mask passes the shape validator and is
+        silently ``cast("int64")`` by the deriver (truncation, not rejection).
+
+        Integral float values behave like their int counterpart, but a
+        non-integral endpoint would be silently truncated. Loud dtype rejection
+        would be safer. LOW hardening gap; production always passes int32.
+        """
+        f = paddle.to_tensor(np.full([8], 8.0, dtype="float32")).reshape(
+            [1, 1, 8, 1]
+        )
+        _validate_csa_docmask_shape(f, 1, 8)  # shape validator does NOT reject
+        _, _, iv, dlens, _ = self._derive(f, 8)
+        self.assertTrue(bool(iv.all()))
+        self.assertEqual(dlens.numpy().tolist(), [8])  # float silently -> int
+
     def test_no_negative_doc_len_over_random_sweep(self):
         rng = np.random.default_rng(0)
         s = 64
@@ -390,6 +426,45 @@ class TestHCAAgreesWithPackedMask(unittest.TestCase):
                         f"{layout} row {q}: HCA compressed groups cross the "
                         "document boundary the MQA path uses",
                     )
+
+
+class TestIndexerLossPadMaskRequestW(unittest.TestCase):
+    """W2: the indexer-loss row mask comes from ``input_ids != pad_token_id``,
+    NOT from the document metadata.
+
+    A packed sequence's trailing padding is folded into the last document's row
+    interval, so ``is_valid`` (derived from ``attn_mask_startend_row_indices``)
+    still marks those pad rows valid. ``_indexer_loss_mask`` must therefore drop
+    exactly the pad rows -- from both the KL sum and its denominator -- using
+    ``input_ids``. No other test in this suite feeds ``input_ids`` to the layer.
+    CPU-only: exercises the pure-tensor mask method, no kernel.
+    """
+
+    def test_pad_tail_excluded_from_indexer_loss(self):
+        seqlen, real_tokens = 256, 200
+        module = _build_module(_create_mqa_config("mqa"))
+        # One document spanning the whole buffer -> is_valid is all True, i.e.
+        # the mask cannot express the pad tail (the Request-W phenomenon).
+        row_end = _row_end([seqlen], seqlen)
+        _, _, is_valid, _, _ = _derive_csa_doc_boundaries(row_end, seqlen)
+        ids = np.zeros([1, seqlen], dtype="int64")
+        ids[0, :real_tokens] = np.arange(1, real_tokens + 1)  # nonzero real ids
+        loss_mask, valid_rows = module._indexer_loss_mask(
+            paddle.to_tensor(ids), 1, seqlen
+        )
+        lm = loss_mask.numpy().reshape(-1)
+        # is_valid over-counts by exactly the folded pad tail; input_ids is truth
+        self.assertEqual(int(is_valid.cast("int32").sum()), seqlen)
+        self.assertEqual(int(valid_rows), real_tokens)
+        self.assertTrue(bool((lm[:real_tokens] == 1).all()))
+        self.assertTrue(bool((lm[real_tokens:] == 0).all()))
+        self.assertEqual(seqlen - int(valid_rows), seqlen - real_tokens)
+
+    def test_no_input_ids_falls_back_to_plain_mean(self):
+        module = _build_module(_create_mqa_config("mqa"))
+        loss_mask, valid_rows = module._indexer_loss_mask(None, 1, 16)
+        self.assertIsNone(loss_mask)
+        self.assertIsNone(valid_rows)
 
 
 def _leaf(t):

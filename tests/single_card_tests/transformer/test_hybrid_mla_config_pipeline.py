@@ -67,6 +67,7 @@ _YAML_DIR = _REPO_ROOT / "conf" / "online"
 _MHA = "ernielite_layer43_mla_hca"
 _MQA = "ernielite_layer43_mla_mqa_hca"
 _DSA = "ernielite_layer43_mla_dsa_hca"
+_DENSE = "ernielite_layer43_non_absorbed_mqa_dense"
 
 # csa_compress_ratios == -2 marks a hybrid-MLA layer; 43 is the MTP layer.
 _MINUS2_LAYERS = (8, 17, 26, 34, 42, 43)
@@ -251,13 +252,57 @@ class TestLayerDispatchTable(unittest.TestCase):
         self._assert_table(_MHA, "DotProductAttention", None)
 
     def test_mqa_uses_mqa_latent_with_dsa_indexer(self):
-        # ``non_absorbed_mqa`` always builds the DSA indexer now (the DSA-less
-        # "mqa" mode is unreachable from config), so mqa dispatches exactly like
-        # dsa: MQALatentAttention core + DSAIndexer.
+        # ``non_absorbed_mqa`` builds the DSA indexer unless
+        # ``non_absorbed_mqa_dense`` drops it (see the test below), so mqa
+        # dispatches exactly like dsa: MQALatentAttention core + DSAIndexer.
         self._assert_table(_MQA, "MQALatentAttention", "DSAIndexer")
 
     def test_mqa_dsa_uses_mqa_latent_with_dsa_indexer(self):
         self._assert_table(_DSA, "MQALatentAttention", "DSAIndexer")
+
+    def test_non_absorbed_mqa_dense_drops_the_indexer(self):
+        """``non_absorbed_mqa_dense`` keeps the MQA core but removes the indexer.
+
+        That is what makes the mode a dense-MHA equivalent: the layer falls into
+        ``MQALatentAttention``'s ``indexer is None`` branch
+        (mqa_latent_attention.py:268) and attends to the full per-document causal
+        set. Only the -2 layers may change; the HCA layers must keep their
+        ``CSAIndexer``, which ``_assert_table`` checks on every layer.
+        """
+        _, provider = _load_provider(_DSA)
+        self.assertTrue(provider.non_absorbed_mqa)
+        provider.non_absorbed_mqa_dense = True
+        n_total = provider.num_hidden_layers + (
+            getattr(provider, "num_nextn_predict_layers", 0) or 0
+        )
+        for li in _MINUS2_LAYERS:
+            with self.subTest(layer=li):
+                ratio, attn_cls, core_cls, indexer_cls = _dispatch(provider, li)
+                self.assertEqual(ratio, -2)
+                self.assertEqual(attn_cls, "MLASelfAttention")
+                self.assertEqual(core_cls, "MQALatentAttention")
+                self.assertIsNone(indexer_cls)
+        for li in range(n_total):
+            if li in _MINUS2_LAYERS:
+                continue
+            self.assertEqual(_dispatch(provider, li)[3], "CSAIndexer", f"L{li}")
+
+    def test_dense_switch_reaches_provider_from_json(self):
+        """The production ``non_absorbed_mqa_dense`` config must dispatch dense.
+
+        The rejection of the switch *alone* is asserted where a config is built
+        from scratch (``test_mqa_latent_attention.py``
+        ``test_dense_switch_alone_is_rejected``); re-running ``__post_init__`` on
+        an already-normalised provider trips unrelated validation.
+        """
+        prov = _load_provider(_DENSE)[1]
+        self.assertTrue(prov.non_absorbed_mqa)
+        self.assertTrue(prov.non_absorbed_mqa_dense)
+        # No sink either, so this config adds no parameter at all vs _MHA.
+        self.assertFalse(getattr(prov, "add_full_attention_sink_bias", False))
+        for li in _MINUS2_LAYERS:
+            with self.subTest(layer=li):
+                self.assertIsNone(_dispatch(prov, li)[3])
 
     def test_switches_reach_provider(self):
         # The JSON switches must survive onto the provider (not silently
