@@ -377,8 +377,27 @@ def _check_index_invariants(test, indices, row_end, seqlen, expect_full=False):
 # is function-local on purpose: importing this module must never require the
 # parent repo, since the direct-construction fixtures above do not need it.
 # ---------------------------------------------------------------------------
-_REPO_ROOT = Path(__file__).resolve().parents[5]
-_CONFIG_DIR = _REPO_ROOT / "model_config_separated" / "conf" / "fleet_align"
+_CONFIG_SUBDIR = Path("model_config_separated") / "conf" / "fleet_align"
+
+
+def _find_repo_root():
+    """Walk up to the erniebot checkout that owns the production configs.
+
+    A fixed ancestor index would raise ``IndexError`` at import time wherever
+    PaddleFleet is checked out standalone (upstream CI does exactly that), which
+    kills collection for every module importing this one. On a miss, return a
+    path that does not exist so the config-driven suites skip instead.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        if (parent / _CONFIG_SUBDIR).is_dir():
+            return parent
+    return here.parent / "_no_erniebot_parent_repo"
+
+
+_REPO_ROOT = _find_repo_root()
+_CONFIG_DIR = _REPO_ROOT / _CONFIG_SUBDIR
+_PARENT_REPO_AVAILABLE = _CONFIG_DIR.is_dir()
 
 _MHA_CFG = "ernielite_layer43_mla_hca"
 _MQA_CFG = "ernielite_layer43_mla_mqa_hca"

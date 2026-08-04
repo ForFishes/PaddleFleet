@@ -57,6 +57,7 @@ from .hybrid_mla_utils import (
     _MHA_CFG as _MHA,
     _MINUS2_LAYERS,
     _MQA_CFG as _MQA,
+    _PARENT_REPO_AVAILABLE,
     _REPO_ROOT,
     _build_real_attn,
     _load_provider,
@@ -68,6 +69,18 @@ _YAML_DIR = _REPO_ROOT / "conf" / "online"
 
 if not _try_use_cuda_device():
     _stub_device_capability()
+
+
+def setUpModule():
+    """Every test here is driven off the erniebot JSON/YAML on disk, so the
+    whole module is meaningless in a standalone PaddleFleet checkout (which is
+    what upstream CI builds). Skipping from here rather than at import time
+    keeps the tests collected, so pytest still exits 0.
+    """
+    if not _PARENT_REPO_AVAILABLE:
+        raise unittest.SkipTest(
+            f"requires the erniebot parent repo configs at {_CONFIG_DIR}"
+        )
 
 
 def _requires_cuda(obj):
