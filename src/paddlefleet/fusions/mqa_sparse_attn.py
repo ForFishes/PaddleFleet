@@ -143,6 +143,13 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
             topk_length=topk_len_flat.reshape([b, s]),
         )  # out [b, s, 64, d_v], lse [b, s, 64]
 
+        # ``token_indices`` is saved rather than recomputed so the backward always
+        # differentiates the exact support the forward used. Under full recompute
+        # the forward runs twice: the indexer's top-k *order* is not reproducible
+        # once a document is longer than the top-k budget (measured 0% churn at
+        # doc_len<=512, ~83% at 8192), but the selected *set* is -- 0% set churn
+        # over Gaussian, low-rank and heavy-tailed activations; it only churns
+        # under exact score ties, which continuous q.k does not produce.
         ctx.save_for_backward(
             q_pad, kv, out, lse, token_indices, sink, topk_len_flat
         )
@@ -216,6 +223,11 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
         # [ablation gate] HYSPARSE_DSA_FINITE_SINK_FIX=0 disables the finite-sink
         # LSE correction to reproduce the exact online (v2) DSA backward behavior
         # (KV-only LSE fed verbatim). Default on (=1). Root-cause confirmation only.
+        #
+        # This gate is load-bearing and silent: turning it off leaves the forward
+        # output bit-identical (it only touches the backward), while ``dq`` gets
+        # ~75x and ``dkv`` ~120x worse against an autograd reference. Do not use
+        # forward agreement to conclude the backward is fine.
         _dsa_finite_sink_fix = (
             os.environ.get("HYSPARSE_DSA_FINITE_SINK_FIX", "1") != "0"
         )
@@ -238,6 +250,12 @@ class _MQASparseAttention(paddle.autograd.PyLayer):
             softmax_scale=ctx.sm_scale,
             topk_length=topk_len_flat,
         )
+        # ``dkv`` is not run-to-run reproducible: this kernel accumulates the KV
+        # gradient with atomics, so two calls on identical inputs differ by
+        # rel ~2e-3 (measured for both the MQA latent layout and the symmetric
+        # Dk=Dv layout the plain CSA/HCA layers use, i.e. this is a pre-existing
+        # property of the shared kernel, not of the non-absorbed MQA path).
+        # ``dq_flat`` is bit-stable.
 
         gq, gk, gsink = ctx.needs_grad
         dq = None

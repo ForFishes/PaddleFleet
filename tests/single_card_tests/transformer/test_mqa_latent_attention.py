@@ -295,9 +295,33 @@ class TestHybridMLAConfig(unittest.TestCase):
         self.assertTrue(config.non_absorbed_mqa_dense)
 
     def test_index_dims_unvalidated_when_non_absorbed_mqa_off(self):
-        # With the flag off the -2 layers are dense MHA; the indexer fields are
-        # unused and left at their defaults without triggering the validation.
-        config = TransformerConfig(**self._kwargs(non_absorbed_mqa=False))
+        """With the flag off the -2 layers are dense MHA, so the indexer fields
+        are unused and must not be validated at all.
+
+        Asserting only that a *default* config builds is near-tautological: the
+        defaults are ``None``, which is exactly what
+        ``test_index_dims_must_be_positive_ints`` shows the flag-on path
+        rejects, but nothing pins the other three rejections. So feed the exact
+        values the three tests above prove are rejected when the flag is on --
+        head_dim != 128, topk not a multiple of 128, topk > 2048 -- and assert
+        each one builds and survives onto the config unchanged.
+        """
+        bad = {
+            "dsa_index_n_heads": None,
+            "dsa_index_head_dim": 64,
+            "dsa_index_topk": 100,
+        }
+        for field, value in [*bad.items(), ("dsa_index_topk", 2048 + 128)]:
+            with self.subTest(field=field, value=value):
+                config = TransformerConfig(
+                    **self._kwargs(non_absorbed_mqa=False, **{field: value})
+                )
+                self.assertFalse(config.non_absorbed_mqa)
+                self.assertEqual(getattr(config, field), value)
+        # ... and all of them together, still no raise.
+        config = TransformerConfig(
+            **self._kwargs(non_absorbed_mqa=False, **bad)
+        )
         self.assertFalse(config.non_absorbed_mqa)
 
 
