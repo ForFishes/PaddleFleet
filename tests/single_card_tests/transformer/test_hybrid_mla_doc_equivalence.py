@@ -56,10 +56,8 @@ from .hybrid_mla_utils import (
     _CAPTURED,
     _GPU,
     DV,
-    HIDDEN,
     INDEX_TOPK,
     K_CHANNELS,
-    Q_LORA,
     V_HEAD_DIM,
     WINDOW,
     H,
@@ -627,10 +625,7 @@ class TestMQAKernelPackedVsSingle(unittest.TestCase):
 
 
 def _dsa_inputs(seqlen, seed=0):
-    query, key, w_v = _make_inputs(seqlen, seed=seed)
-    x = (paddle.randn([1, seqlen, HIDDEN]) * 0.5).cast("bfloat16")
-    qr = (paddle.randn([1, seqlen, Q_LORA]) * 0.5).cast("bfloat16")
-    return query, key, w_v, x, qr
+    return _make_inputs(seqlen, seed=seed, with_hidden=True)
 
 
 @_GPU

@@ -14,15 +14,25 @@
 
 """Shared fixtures for the hybrid-MLA (``csa_compress_ratios == -2``) tests.
 
-Not a test module (no ``test_`` prefix, so pytest does not collect it). It holds
-the direct-construction fixtures used by ``test_mqa_latent_attention.py``,
-``test_hybrid_mla_doc_equivalence.py`` and
-``test_hybrid_mla_recompute_mtp_ckpt.py``: the geometry constants, the stub
-sublayers, the config factory, the module builder, the document-boundary
-helpers and the fp32 dense reference.
+Not a test module (no ``test_`` prefix, so pytest does not collect it). Two
+groups of fixtures:
+
+- **Direct construction** -- geometry constants, stub sublayers, the config
+  factory, the module builder, the document-boundary helpers and the fp32 dense
+  reference. Used by ``test_mqa_latent_attention.py``,
+  ``test_hybrid_mla_doc_equivalence.py`` and ``test_hybrid_mla_grad_health.py``.
+- **Production config chain** -- the on-disk config names, the ``-2`` layer
+  index set, the CUDA probe, the process-group stubs and the
+  ``ErnieFleetModelConfig -> Ernie5V2Provider -> build_spec_layer`` loader that
+  mirrors ``ernie5/pretrain.py``. Used by
+  ``test_hybrid_mla_config_pipeline.py`` and
+  ``test_hybrid_mla_recompute_mtp_ckpt.py``. All parent-repo imports are local
+  to the functions, so importing this module never requires the parent repo.
 """
 
+import sys
 import unittest
+from pathlib import Path
 
 import numpy as np
 import paddle
@@ -358,3 +368,108 @@ def _check_index_invariants(test, indices, row_end, seqlen, expect_full=False):
                 set(range(start, q + 1)),
                 f"row {q}: not the full causal set",
             )
+
+
+# ---------------------------------------------------------------------------
+# Production config chain, mirroring ``ernie5/pretrain.py``
+# (ErnieFleetModelConfig -> Ernie5V2Provider -> apply_ernie_config_overrides
+# -> LayerSpec dispatch -> build_spec_layer). Every parent-repo import below
+# is function-local on purpose: importing this module must never require the
+# parent repo, since the direct-construction fixtures above do not need it.
+# ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[5]
+_CONFIG_DIR = _REPO_ROOT / "model_config_separated" / "conf" / "fleet_align"
+
+_MHA_CFG = "ernielite_layer43_mla_hca"
+_MQA_CFG = "ernielite_layer43_mla_mqa_hca"
+_DSA_CFG = "ernielite_layer43_mla_dsa_hca"
+_DENSE_CFG = "ernielite_layer43_non_absorbed_mqa_dense"
+
+# csa_compress_ratios == -2 marks a hybrid-MLA layer; 43 is the MTP layer.
+_MINUS2_LAYERS = (8, 17, 26, 34, 42, 43)
+_NUM_HIDDEN = 43
+
+
+def _add_repo_root_to_sys_path():
+    """The pytest invocation only puts ``PaddleFleet/src`` and
+    ``PaddleFormers`` on PYTHONPATH; add the repo root (for ``fleet_model``)
+    and ``ernie5`` (for ``src.ernie_core_compat``).
+    """
+    for p in (str(_REPO_ROOT), str(_REPO_ROOT / "ernie5")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+
+
+def _try_use_cuda_device():
+    if not paddle.is_compiled_with_cuda():
+        return False
+    try:
+        paddle.set_device("gpu:0")
+        place = str(paddle.empty([1]).place).lower()
+    except Exception:
+        return False
+    return paddle.get_device().startswith("gpu") and (
+        "gpu" in place or "cuda" in place
+    )
+
+
+def _stub_device_capability():
+    """Let the pure-config (non-kernel) tests import paddlefleet and build the
+    provider on a box without a usable GPU.
+    """
+    paddle.cuda.get_device_capability = lambda device=None: (0, 0)
+    paddle.device.cuda.get_device_capability = lambda device=None: (0, 0)
+
+
+class _FakeGroup:
+    def __init__(self, nranks=1):
+        self.nranks = nranks
+        self.world_size = nranks
+        self.ranks = list(range(nranks))
+        self.rank = 0
+
+
+class _FakePGCollection:
+    def __init__(self):
+        self.tp = _FakeGroup(1)
+        self.cp = _FakeGroup(1)
+
+
+def _load_provider(name):
+    """``(cfg, provider)`` from the on-disk ``model_config.json``."""
+    _add_repo_root_to_sys_path()
+    from fleet_model.ernie5_v2.modeling import (
+        Ernie5V2Provider,
+        apply_ernie_config_overrides,
+    )
+    from src.ernie_core_compat.configuration import ErnieFleetModelConfig
+
+    cfg = ErnieFleetModelConfig.from_pretrained(
+        str(_CONFIG_DIR / name), _configuration_file="model_config.json"
+    )
+    provider = Ernie5V2Provider.from_config(cfg)
+    apply_ernie_config_overrides(provider, cfg)
+    return cfg, provider
+
+
+def _build_real_attn(provider, layer_number, seed=42):
+    """Instantiate the real self-attention module for one layer index."""
+    from paddle.distributed.fleet.meta_parallel import build_spec_layer
+
+    from paddlefleet.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+    from paddlefleet.tensor_parallel.random import (
+        model_parallel_cuda_manual_seed,
+    )
+
+    model_parallel_cuda_manual_seed(seed)
+    spec = get_gpt_layer_local_spec(
+        config=provider,
+        normalization=provider.normalization,
+        layer_number=layer_number,
+    ).sublayers_spec.self_attn
+    return build_spec_layer(
+        spec,
+        config=provider,
+        layer_number=layer_number,
+        pg_collection=_FakePGCollection(),
+    )

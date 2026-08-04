@@ -47,15 +47,27 @@ from paddlefleet.transformer.dsa_attention import DSAIndexerLossLoggingHelper
 
 from .hybrid_mla_utils import (
     _CAPTURED,
+    _CONFIG_DIR,
+    _DSA_CFG,
     _GPU,
+    _MHA_CFG,
+    _MINUS2_LAYERS,
+    _MQA_CFG,
+    _NUM_HIDDEN,
     K_CHANNELS,
     H,
+    _add_repo_root_to_sys_path,
     _build_module,
+    _build_real_attn,
     _create_mqa_config,
+    _load_provider,
     _make_inputs,
     _rel,
     _row_end,
+    _try_use_cuda_device,
 )
+
+_add_repo_root_to_sys_path()
 
 
 # ===========================================================================
@@ -215,22 +227,6 @@ class TestMTPTrackerSlot(unittest.TestCase):
 # ===========================================================================
 # Part 5 -- AOA name mapping (runs on CPU; loads the real production configs)
 # ===========================================================================
-import sys
-from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parents[5]
-for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "ernie5")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-_CONFIG_DIR = _REPO_ROOT / "model_config_separated" / "conf" / "fleet_align"
-
-_MHA_CFG = "ernielite_layer43_mla_hca"
-_MQA_CFG = "ernielite_layer43_mla_mqa_hca"
-_DSA_CFG = "ernielite_layer43_mla_dsa_hca"
-_MINUS2_LAYERS = (8, 17, 26, 34, 42, 43)  # 43 == the MTP layer
-_NUM_HIDDEN = 43
-
-
 def _aoa_configs_available():
     try:
         import paddle as _pd
@@ -376,71 +372,10 @@ class TestSinkOptimizerRouting(unittest.TestCase):
 # ===========================================================================
 # Part 4 -- Checkpoint key-set compatibility (real modules; needs CUDA)
 # ===========================================================================
-def _usable_cuda():
-    if not paddle.is_compiled_with_cuda():
-        return False
-    try:
-        paddle.set_device("gpu:0")
-        return True
-    except Exception:
-        return False
-
-
 _REAL = unittest.skipUnless(
-    _usable_cuda() and _aoa_configs_available(),
+    _try_use_cuda_device() and _aoa_configs_available(),
     "requires a usable CUDA device + the production ernie5_v2 configs",
 )
-
-
-class _FakeGroup:
-    def __init__(self, n=1):
-        self.nranks = n
-        self.world_size = n
-        self.ranks = list(range(n))
-        self.rank = 0
-
-
-class _FakePG:
-    def __init__(self):
-        self.tp = _FakeGroup(1)
-        self.cp = _FakeGroup(1)
-
-
-def _load_provider(name):
-    from fleet_model.ernie5_v2.modeling import (
-        Ernie5V2Provider,
-        apply_ernie_config_overrides,
-    )
-    from src.ernie_core_compat.configuration import ErnieFleetModelConfig
-
-    cfg = ErnieFleetModelConfig.from_pretrained(
-        str(_CONFIG_DIR / name), _configuration_file="model_config.json"
-    )
-    provider = Ernie5V2Provider.from_config(cfg)
-    apply_ernie_config_overrides(provider, cfg)
-    return provider
-
-
-def _build_real_attn(provider, layer_number):
-    from paddle.distributed.fleet.meta_parallel import build_spec_layer
-
-    from paddlefleet.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-    from paddlefleet.tensor_parallel.random import (
-        model_parallel_cuda_manual_seed,
-    )
-
-    model_parallel_cuda_manual_seed(2026)
-    spec = get_gpt_layer_local_spec(
-        config=provider,
-        normalization=provider.normalization,
-        layer_number=layer_number,
-    ).sublayers_spec.self_attn
-    return build_spec_layer(
-        spec,
-        config=provider,
-        layer_number=layer_number,
-        pg_collection=_FakePG(),
-    )
 
 
 def _key_sig(module):
@@ -476,7 +411,7 @@ class TestCheckpointKeySets(unittest.TestCase):
     _SINK = "core_attention.softmax_offset"
 
     def _keys(self, cfg_name, sink=None):
-        provider = _load_provider(cfg_name)
+        provider = _load_provider(cfg_name)[1]
         if sink is not None:
             # sink is the one switch we toggle synthetically; mode/indexer come
             # faithfully from the real config (mode-toggling on one provider is

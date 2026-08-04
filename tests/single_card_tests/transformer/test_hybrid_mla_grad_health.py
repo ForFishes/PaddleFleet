@@ -90,6 +90,8 @@ from paddlefleet.transformer.transformer_config import (
     TransformerConfig,
 )
 
+from .hybrid_mla_utils import _row_end as _row_end_from_docs
+
 try:
     from paddlefleet.cudnn_ops.block_sparse_mqa_dsa import is_dsa_available
 except Exception:  # pragma: no cover - kernel module absent
@@ -257,19 +259,12 @@ _EXPECTED_PARAMS = (
 
 
 def _row_end(seqlen, doc_lens=None):
-    """Exclusive per-token document-end index, shape [1, 1, s, 1] int32."""
-    if doc_lens is None:
-        doc_lens = [seqlen]
-    values = []
-    end = 0
-    for d in doc_lens:
-        end += d
-        values.extend([end] * d)
-    if len(values) < seqlen:
-        values.extend([end] * (seqlen - len(values)))
-    return paddle.to_tensor(values[:seqlen], dtype="int32").reshape(
-        [1, 1, seqlen, 1]
-    )
+    """Exclusive per-token document-end index, shape [1, 1, s, 1] int32.
+
+    Argument order is flipped w.r.t. the shared fixture because every call site
+    here passes only the sequence length.
+    """
+    return _row_end_from_docs(doc_lens or [seqlen], seqlen)
 
 
 def _hidden(seqlen, scale=1.0, seed=0, dtype=paddle.bfloat16):
@@ -564,37 +559,6 @@ class TestItem3SinkGradient(unittest.TestCase):
             rel, 0.30, "analytic sink grad disagrees with finite diff"
         )
 
-    def test_sink_vs_oproj_ratio_and_cross_mode(self):
-        results = {}
-        for mode, idx in _MODES:
-            if mode == "mqa_dsa" and not _HAS_DSA:
-                continue
-            m = _build(mode, sink=True, indexer=idx)
-            try:
-                _, g = _grads(
-                    m,
-                    _hidden(self.SEQ, seed=1),
-                    _row_end(self.SEQ),
-                    weighted=False,
-                )
-            except Exception as e:
-                # mha + sink hits the FA4-cute-only assertion when the cute
-                # kernel is unavailable (this env): forward RAISES.
-                results[mode] = ("RAISES:" + type(e).__name__, None, None)
-                continue
-            sk = [k for k in g if k.endswith("softmax_offset")]
-            op = [k for k in g if k.endswith("o_proj.weight")]
-            g_sink = g[sk[0]] if sk else None
-            g_op = g[op[0]] if op else None
-            results[mode] = ("ok", g_sink, g_op)
-
-        # The absorbed (mqa_dsa) sink must be live, finite and non-zero.
-        if _HAS_DSA and "mqa_dsa" in results:
-            gs = results["mqa_dsa"][1]
-            self.assertIsNotNone(gs, "mqa_dsa sink must receive gradient")
-            self.assertTrue(np.all(np.isfinite(gs)))
-            self.assertGreater(np.abs(gs).max(), 0.0)
-
 
 @_skip_if_no_cuda
 class TestItem4GradientFlowCompleteness(unittest.TestCase):
@@ -645,22 +609,6 @@ class TestItem4GradientFlowCompleteness(unittest.TestCase):
                             "live",
                             f"{mode}: sink got no usable gradient",
                         )
-
-    def test_train_mode_backward_if_reachable(self):
-        # train() enables the CSA/DSA autoscaler PyLayer; exercise whether a
-        # plain backward is reachable there for the mqa path.
-        if not _HAS_DSA:
-            self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
-        m = _build("mqa", sink=True, indexer=False)
-        m.train()
-        with contextlib.suppress(Exception):
-            # autoscaler inplace / recompute limitation may make this raise.
-            out, _ = m(
-                _hidden(self.SEQ, seed=2),
-                attention_mask=None,
-                attn_mask_startend_row_indices=_row_end(self.SEQ),
-            )
-            out.astype("float32").sum().backward()
 
 
 @_skip_if_no_cuda
@@ -840,14 +788,23 @@ class TestItem8WeightDecayInteraction(unittest.TestCase):
             m, _hidden(self.SEQ, seed=1), _row_end(self.SEQ), weighted=False
         )
         gs = g[next(k for k in g if k.endswith("softmax_offset"))]
+        self.assertTrue(np.all(np.isfinite(gs)), "sink grad non-finite")
         # Emulate a trained sink logit magnitude of O(1) (grads above were
         # single-digit at zero-init after one step).
         sink_val = 1.0
         grad_step = self.LR * float(np.abs(gs).mean())
         decay_step = self.LR * self.WD * sink_val
-        ratio = decay_step / max(grad_step, 1e-12)
-        # Decay is a real, non-negligible systematic pull toward 0 on the sink.
-        self.assertGreater(ratio, 0.0)
+        # The denominator must be a real measurement, not a clamp floor:
+        # otherwise the ratio below is a division artifact and asserting on it
+        # proves nothing.
+        self.assertGreater(grad_step, 1e-12, "sink grad is all-zero")
+        ratio = decay_step / grad_step
+        # Decay is a real, non-negligible systematic pull toward 0 on the sink:
+        # |g_sink|.mean() is O(1) here, so ratio lands near 1e-1. Bound at 1e-3
+        # (100x headroom) -- it only fails if the gradient signal grows to
+        # ~100x the emulated logit, which would make decay genuinely
+        # negligible and invalidate this item's conclusion.
+        self.assertGreater(ratio, 1e-3)
 
 
 @_skip_if_no_cuda

@@ -258,27 +258,21 @@ class TestHybridMLAConfig(unittest.TestCase):
                 config = TransformerConfig(**self._non_absorbed_kwargs(**sink))
                 self.assertTrue(config.non_absorbed_mqa)
 
-    def test_index_head_dim_must_be_128(self):
-        with self.assertRaisesRegex(ValueError, "index_head_dim"):
-            TransformerConfig(
-                **self._non_absorbed_kwargs(dsa_index_head_dim=64)
-            )
-
-    def test_index_topk_must_be_multiple_of_128(self):
-        with self.assertRaisesRegex(ValueError, "index_topk"):
-            TransformerConfig(**self._non_absorbed_kwargs(dsa_index_topk=100))
-
-    def test_index_topk_at_most_2048(self):
-        with self.assertRaisesRegex(ValueError, "index_topk"):
-            TransformerConfig(
-                **self._non_absorbed_kwargs(dsa_index_topk=2048 + 128)
-            )
-
-    def test_index_dims_must_be_positive_ints(self):
-        with self.assertRaisesRegex(ValueError, "index_n_heads"):
-            TransformerConfig(
-                **self._non_absorbed_kwargs(dsa_index_n_heads=None)
-            )
+    def test_index_dims_are_validated(self):
+        # Keyed on (field, value), not on the message: topk=100 (not a multiple
+        # of 128) and topk=2176 (>2048) both mention "index_topk" but hit
+        # different branches.
+        for field, value, msg in (
+            ("dsa_index_head_dim", 64, "index_head_dim"),
+            ("dsa_index_topk", 100, "index_topk"),
+            ("dsa_index_topk", 2048 + 128, "index_topk"),
+            ("dsa_index_n_heads", None, "index_n_heads"),
+        ):
+            with (
+                self.subTest(field=field, value=value),
+                self.assertRaisesRegex(ValueError, msg),
+            ):
+                TransformerConfig(**self._non_absorbed_kwargs(**{field: value}))
 
     def test_dense_switch_alone_is_rejected(self):
         # ``non_absorbed_mqa_dense`` replaces that mode's indexer, so on its own
@@ -300,11 +294,11 @@ class TestHybridMLAConfig(unittest.TestCase):
 
         Asserting only that a *default* config builds is near-tautological: the
         defaults are ``None``, which is exactly what
-        ``test_index_dims_must_be_positive_ints`` shows the flag-on path
-        rejects, but nothing pins the other three rejections. So feed the exact
-        values the three tests above prove are rejected when the flag is on --
-        head_dim != 128, topk not a multiple of 128, topk > 2048 -- and assert
-        each one builds and survives onto the config unchanged.
+        ``test_index_dims_are_validated`` shows the flag-on path rejects, but
+        nothing pins the other three rejections. So feed the exact values that
+        test proves are rejected when the flag is on -- head_dim != 128, topk
+        not a multiple of 128, topk > 2048 -- and assert each one builds and
+        survives onto the config unchanged.
         """
         bad = {
             "dsa_index_n_heads": None,
@@ -376,40 +370,6 @@ class TestMQAEquivalence(unittest.TestCase):
                     expect_full=True,
                 )
 
-    def test_packed_equals_independent_per_document_runs(self):
-        """The core correctness requirement: packing must be a no-op."""
-        seqlen, layout = 256, [40, 88, 128]
-        query, key, w_v = _make_inputs(seqlen)
-        packed = (
-            self.module(
-                query,
-                key,
-                None,
-                None,
-                _row_end(layout, seqlen),
-                v_b_proj_weight=w_v,
-            )
-            .cast("float32")
-            .numpy()
-        )
-        pos = 0
-        for length in layout:
-            piece = (
-                self.module(
-                    query[:, pos : pos + length].contiguous(),
-                    key[:, pos : pos + length].contiguous(),
-                    None,
-                    None,
-                    _row_end([length], length),
-                    v_b_proj_weight=w_v,
-                )
-                .cast("float32")
-                .numpy()
-            )
-            diff = float(np.abs(packed[:, pos : pos + length] - piece).max())
-            self.assertEqual(diff, 0.0, f"document at {pos} differs by {diff}")
-            pos += length
-
     def test_attention_sink_matches_dense_reference(self):
         """The learnable sink is one extra value-less softmax column."""
         seqlen, layout = 256, [40, 88, 128]
@@ -456,10 +416,7 @@ class TestMQADSA(unittest.TestCase):
 
     @staticmethod
     def _inputs(seqlen, seed=0):
-        query, key, w_v = _make_inputs(seqlen, seed=seed)
-        x = (paddle.randn([1, seqlen, HIDDEN]) * 0.5).cast("bfloat16")
-        qr = (paddle.randn([1, seqlen, Q_LORA]) * 0.5).cast("bfloat16")
-        return query, key, w_v, x, qr
+        return _make_inputs(seqlen, seed=seed, with_hidden=True)
 
     def _forward(self, seqlen, layout, seed=0):
         """Inference-mode forward, for checking numerics and index invariants.

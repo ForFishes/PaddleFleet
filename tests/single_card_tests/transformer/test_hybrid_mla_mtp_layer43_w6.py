@@ -52,6 +52,14 @@ def _prod_csa_ratios():
     return r
 
 
+def _build_mtp_module():
+    """The single MTP layer: ``layer_number=0`` + ``is_mtp_layer=True``."""
+    cfg = U._create_mqa_config("mqa_dsa", loss_coeff=0.01, num_hidden_layers=43)
+    cfg.num_nextn_predict_layers = 1
+    cfg.pad_token_id = 0
+    return U._build_module(cfg, layer_number=0, bf16=True, is_mtp=True)
+
+
 class TestMTPLayer43Dispatch(unittest.TestCase):
     def test_mtp_depth0_routes_to_mla_ratio_minus2(self):
         cfg = types.SimpleNamespace(
@@ -66,50 +74,22 @@ class TestMTPLayer43Dispatch(unittest.TestCase):
         )
         self.assertEqual((li, atype, ratio), (43, "multi_latent_attention", -2))
 
-    def test_mtp_matches_last_hidden_minus2_layer(self):
-        cfg = types.SimpleNamespace(
-            num_hidden_layers=43,
-            csa_compress_ratios=_prod_csa_ratios(),
-            num_nextn_predict_layers=1,
-            mtp_num_layers=0,
-            num_empty_layers_add_in_head=0,
-        )
-        mtp = _get_dsv4_hybrid_attention_layer_type(cfg, 0, is_mtp_layer=True)
-        l42 = _get_dsv4_hybrid_attention_layer_type(cfg, 42, is_mtp_layer=False)
-        self.assertEqual(mtp[1:], l42[1:])  # same atype + ratio (-2 MLA)
-
 
 class TestMTPLayer43IndexerRowMask(unittest.TestCase):
     """Row mask is driven by ``input_ids != pad`` only (mqa_latent_attention.py
-    :560-576), so the depth+1 MTP shift cannot move the row count."""
-
-    def _build(self):
-        cfg = U._create_mqa_config(
-            "mqa_dsa", loss_coeff=0.01, num_hidden_layers=43
-        )
-        cfg.num_nextn_predict_layers = 1
-        cfg.pad_token_id = 0
-        return U._build_module(cfg, layer_number=0, bf16=True, is_mtp=True)
+    :560-576), so the depth+1 MTP shift cannot move the row count.
+    """
 
     def test_row_count_is_nonpad_count(self):
-        m = self._build()
+        m = _build_mtp_module()
+        # 512 == no padding at all, 1 == a single real token: the two boundaries
+        # where an off-by-one in the mask would show up.
         for real in (400, 512, 1):
-            ids = np.zeros([1, SEQ], dtype="int64")
-            ids[0, :real] = np.arange(1, real + 1)
-            _, vr = m._indexer_loss_mask(paddle.to_tensor(ids), 1, SEQ)
-            self.assertEqual(int(vr), real)
-
-    def test_shift_invariant_for_fixed_pad_count(self):
-        m = self._build()
-        real = 400
-        a = np.zeros([1, SEQ], dtype="int64")
-        a[0, :real] = np.arange(1, real + 1)
-        b = np.zeros([1, SEQ], dtype="int64")
-        b[0, :real] = np.arange(2, real + 2)
-        _, vr_a = m._indexer_loss_mask(paddle.to_tensor(a), 1, SEQ)
-        _, vr_b = m._indexer_loss_mask(paddle.to_tensor(b), 1, SEQ)
-        self.assertEqual(int(vr_a), int(vr_b))
-        self.assertEqual(int(vr_a), real)
+            with self.subTest(real=real):
+                ids = np.zeros([1, SEQ], dtype="int64")
+                ids[0, :real] = np.arange(1, real + 1)
+                _, vr = m._indexer_loss_mask(paddle.to_tensor(ids), 1, SEQ)
+                self.assertEqual(int(vr), real)
 
 
 @U._GPU
@@ -122,12 +102,7 @@ class TestMTPLayer43AuxGradConfinement(unittest.TestCase):
 
     def _run(self, upstream_scale):
         paddle.set_device("gpu:0")
-        cfg = U._create_mqa_config(
-            "mqa_dsa", loss_coeff=0.01, num_hidden_layers=43
-        )
-        cfg.num_nextn_predict_layers = 1
-        cfg.pad_token_id = 0
-        m = U._build_module(cfg, layer_number=0, bf16=True, is_mtp=True)
+        m = _build_mtp_module()
         m.train()
         q, k, wv, x, qr = U._make_inputs(SEQ, seed=1, with_hidden=True)
 

@@ -42,31 +42,17 @@ import unittest
 import numpy as np
 import paddle
 
-from paddlefleet.cudnn_ops.block_sparse_mqa_dsa import is_dsa_available
 from paddlefleet.fusions.mqa_sparse_attn import (
     _DSA_HEADS,
     _NEG_SINK,
     mqa_sparse_attn,
 )
 
+from .hybrid_mla_utils import _GPU
+
 DK = 576  # absorbed-MQA query/key width (kv_lora_rank 512 + qk_rope 64)
 DV = 512  # value width == leading 512 dims of the shared latent
 SM = DK**-0.5
-
-
-def _kernels_available():
-    if not paddle.is_compiled_with_cuda():
-        return False
-    try:
-        return bool(is_dsa_available())
-    except Exception:
-        return False
-
-
-_GPU = unittest.skipUnless(
-    _kernels_available(),
-    "requires SM100+ FlashMLA sparse fwd + cuDNN DSA bwd kernels",
-)
 
 
 # ---------------------------------------------------------------------------

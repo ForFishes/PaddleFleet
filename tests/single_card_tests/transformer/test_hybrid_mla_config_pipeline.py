@@ -45,55 +45,29 @@ apply_ernie_config_overrides -> LayerSpec dispatch -> build_spec_layer).
 """
 
 import json
-import sys
 import unittest
 from functools import wraps
-from pathlib import Path
 
 import paddle
 
-# The pytest invocation only puts ``third_party/PaddleFleet/src`` and
-# ``third_party/PaddleFormers`` on PYTHONPATH; add the repo root (for
-# ``fleet_model``) and ``ernie5`` (for ``src.ernie_core_compat``) so the
-# production config-loading chain imports.
-_REPO_ROOT = Path(__file__).resolve().parents[5]
-for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "ernie5")):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+from .hybrid_mla_utils import (
+    _CONFIG_DIR,
+    _DENSE_CFG as _DENSE,
+    _DSA_CFG as _DSA,
+    _MHA_CFG as _MHA,
+    _MINUS2_LAYERS,
+    _MQA_CFG as _MQA,
+    _REPO_ROOT,
+    _build_real_attn,
+    _load_provider,
+    _stub_device_capability,
+    _try_use_cuda_device,
+)
 
-_CONFIG_DIR = _REPO_ROOT / "model_config_separated" / "conf" / "fleet_align"
 _YAML_DIR = _REPO_ROOT / "conf" / "online"
 
-_MHA = "ernielite_layer43_mla_hca"
-_MQA = "ernielite_layer43_mla_mqa_hca"
-_DSA = "ernielite_layer43_mla_dsa_hca"
-_DENSE = "ernielite_layer43_non_absorbed_mqa_dense"
-
-# csa_compress_ratios == -2 marks a hybrid-MLA layer; 43 is the MTP layer.
-_MINUS2_LAYERS = (8, 17, 26, 34, 42, 43)
-_SEED = 42
-
-
-def _try_use_cuda_device():
-    if not paddle.is_compiled_with_cuda():
-        return False
-    try:
-        paddle.set_device("gpu:0")
-        place = str(paddle.empty([1]).place).lower()
-    except Exception:
-        return False
-    return paddle.get_device().startswith("gpu") and (
-        "gpu" in place or "cuda" in place
-    )
-
-
-_HAS_USABLE_CUDA = _try_use_cuda_device()
-
-if not _HAS_USABLE_CUDA:
-    # Let the pure-config (non-kernel) tests still import paddlefleet on a box
-    # without a usable GPU.
-    paddle.cuda.get_device_capability = lambda device=None: (0, 0)
-    paddle.device.cuda.get_device_capability = lambda device=None: (0, 0)
+if not _try_use_cuda_device():
+    _stub_device_capability()
 
 
 def _requires_cuda(obj):
@@ -117,41 +91,13 @@ def _requires_cuda(obj):
 
 
 # ---------------------------------------------------------------------------
-# Production config-loading chain, mirroring ernie5/pretrain.py.
+# Production config-loading chain, mirroring ernie5/pretrain.py. The loader
+# (``_load_provider``) and the real-module builder (``_build_real_attn``) are
+# shared via ``hybrid_mla_utils``.
 # ---------------------------------------------------------------------------
 def _load_json(name):
     with open(_CONFIG_DIR / name / "model_config.json") as f:
         return json.load(f)
-
-
-def _load_provider(name):
-    """Load model_config.json exactly like ernie5/pretrain.py does."""
-    from fleet_model.ernie5_v2.modeling import (
-        Ernie5V2Provider,
-        apply_ernie_config_overrides,
-    )
-    from src.ernie_core_compat.configuration import ErnieFleetModelConfig
-
-    cfg = ErnieFleetModelConfig.from_pretrained(
-        str(_CONFIG_DIR / name), _configuration_file="model_config.json"
-    )
-    provider = Ernie5V2Provider.from_config(cfg)
-    apply_ernie_config_overrides(provider, cfg)
-    return cfg, provider
-
-
-class _FakeGroup:
-    def __init__(self, nranks=1):
-        self.nranks = nranks
-        self.world_size = nranks
-        self.ranks = list(range(nranks))
-        self.rank = 0
-
-
-class _FakePGCollection:
-    def __init__(self):
-        self.tp = _FakeGroup(1)
-        self.cp = _FakeGroup(1)
 
 
 def _dispatch(provider, layer_idx):
@@ -188,29 +134,6 @@ def _dispatch(provider, layer_idx):
         if idx is not None:
             indexer_cls = getattr(idx, "layer", idx).__name__
     return ratio, attn_cls, core_cls, indexer_cls
-
-
-def _build_hybrid_mla_layer(provider, layer_number):
-    """Instantiate the real MLASelfAttention for a ``-2`` layer."""
-    from paddle.distributed.fleet.meta_parallel import build_spec_layer
-
-    from paddlefleet.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-    from paddlefleet.tensor_parallel.random import (
-        model_parallel_cuda_manual_seed,
-    )
-
-    model_parallel_cuda_manual_seed(_SEED)
-    spec = get_gpt_layer_local_spec(
-        config=provider,
-        normalization=provider.normalization,
-        layer_number=layer_number,
-    ).sublayers_spec.self_attn
-    return build_spec_layer(
-        spec,
-        config=provider,
-        layer_number=layer_number,
-        pg_collection=_FakePGCollection(),
-    )
 
 
 class TestLayerDispatchTable(unittest.TestCase):
@@ -336,7 +259,7 @@ class TestSinkParameterOnRealModules(unittest.TestCase):
         # The baseline config intentionally omits the flag to avoid perturbing
         # the live reference run.
         _, provider = _load_provider(_MHA)
-        mod = _build_hybrid_mla_layer(provider, _MINUS2_LAYERS[0])
+        mod = _build_real_attn(provider, _MINUS2_LAYERS[0])
         self.assertIsNone(mod.core_attention.softmax_offset)
         self.assertEqual(
             [k for k in mod.state_dict() if k.endswith("softmax_offset")], []
@@ -346,7 +269,7 @@ class TestSinkParameterOnRealModules(unittest.TestCase):
         for name in (_MQA, _DSA):
             with self.subTest(config=name):
                 _, provider = _load_provider(name)
-                mod = _build_hybrid_mla_layer(provider, _MINUS2_LAYERS[0])
+                mod = _build_real_attn(provider, _MINUS2_LAYERS[0])
                 sink = mod.core_attention.softmax_offset
                 self.assertIsNotNone(sink)
                 self.assertEqual(list(sink.shape), [64])
@@ -372,7 +295,7 @@ class TestSinkParameterOnRealModules(unittest.TestCase):
         keys = []
         for name in (_MQA, _DSA):
             _, provider = _load_provider(name)
-            mod = _build_hybrid_mla_layer(provider, _MINUS2_LAYERS[0])
+            mod = _build_real_attn(provider, _MINUS2_LAYERS[0])
             keys.append(
                 sorted(
                     k for k in mod.state_dict() if k.endswith("softmax_offset")
@@ -407,7 +330,7 @@ class TestHybridIndexerReadsModelWideIndexFields(unittest.TestCase):
         # block size).
         provider.dsa_index_n_heads = 32
         provider.dsa_index_topk = 256
-        mod = _build_hybrid_mla_layer(provider, _MINUS2_LAYERS[0])
+        mod = _build_real_attn(provider, _MINUS2_LAYERS[0])
         idx = mod.core_attention.indexer
         self.assertEqual(type(idx).__name__, "DSAIndexer")
         self.assertEqual(idx.n_heads, 32)
