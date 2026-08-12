@@ -28,6 +28,13 @@ with the attention math, and both were found with the probes under
    never runs backward - no error, normal loss curve, zero indexer updates.
    ``keep_indexer_grad_path`` re-enters the graph to keep that path alive.
 
+Neither depends on which attention the ``-2`` hybrid-MLA layers run: phase 2 now
+dispatches them to the dense ``MHADSAWarmupAttention`` rather than latent MQA,
+but that class attaches its KL through the very same
+``TileLangCSAIndexerLossAutoScaler`` and sits inside the very same recompute
+segments, so both failure modes are reached identically. Accordingly every guard
+below is expressed on ``config`` / the PyLayers, never on the attention class.
+
 The tests below run on CPU and do not need the TileLang/cuDNN kernels.
 """
 
@@ -68,6 +75,13 @@ def _make_dsv4_config(**overrides):
         "dsa_index_head_dim": 64,
         "dsa_index_topk": 16,
         "dsa_indexer_loss_coeff": 0.01,
+        # Phase 2. For a CSA layer this widens the KL and makes the main
+        # attention walk the whole compressed range; for a ``-2`` hybrid-MLA
+        # layer it additionally selects the attention *backend* -- the dense
+        # ``MHADSAWarmupAttention`` rather than latent MQA
+        # (hybrid_mla_indexer.py::latent_mqa_enabled). Either way it is the
+        # legal companion of ``train_indexer_only=True``; ``True`` here is the
+        # phase-3 value and is rejected with it.
         "dsa_indexer_use_sparse_loss": False,
         "csa_dense_mode": False,
     }
@@ -76,13 +90,22 @@ def _make_dsv4_config(**overrides):
 
 
 def _make_mqa_config(**overrides):
-    """dsv4-hybrid config whose ``-2`` layers run latent MQA + DSA indexer.
+    """dsv4-hybrid config whose ``-2`` layers carry a DSA indexer.
 
     A ``-2`` layer is a hybrid MLA layer, so ``__post_init__`` demands the whole
     ``hybrid_mla_*`` block before it ever gets to the ``train_indexer_only``
     checks. ``csa_dense_mode=True`` matches the real new-attention configs: the
     128/HCA layers have no CSAIndexer, so the DSAIndexer of the ``-2`` layers is
     the only Indexer in the model.
+
+    Which attention those ``-2`` layers run is a separate question that
+    ``train_indexer_only`` deliberately does not ask: with the inherited
+    ``dsa_indexer_use_sparse_loss=False`` it is the dense
+    ``MHADSAWarmupAttention`` (phase 2), and with ``True`` the absorbed latent
+    ``MQALatentAttention`` (phase 3). Only the *existence* of the indexer
+    matters here, which is exactly what ``has_mqa_indexer`` tests
+    (transformer_config.py:1892-1897 -- ``"mqa_dsa"`` plus a ``-2`` ratio, with
+    no reference to the sparse-loss flag).
     """
     kwargs = {
         "csa_dense_mode": True,
@@ -146,14 +169,17 @@ class TestPhase2ConfigValidation(unittest.TestCase):
     def test_mqa_dsa_indexer_satisfies_the_check_without_any_csa_layer(self):
         # The new-attention phase 2: every CSA-ratio layer is HCA (128) and
         # csa_dense_mode is on, so there is no CSAIndexer anywhere. The only
-        # Indexer is the DSAIndexer of the ``-2`` latent MQA layers.
+        # Indexer is the DSAIndexer of the ``-2`` hybrid-MLA layers, which in
+        # this phase run dense MHA (``MHADSAWarmupAttention``) with that indexer
+        # bolted on.
         config = _make_mqa_config(train_indexer_only=True)
         self.assertTrue(config.train_indexer_only)
         self.assertTrue(config.csa_dense_mode)
 
     def test_mqa_full_causal_rejected(self):
-        # "mqa_full_causal" drops the DSAIndexer (gpt_layer_specs.py passes
-        # indexer=None), which is exactly the phase-1 shape: nothing to train.
+        # "mqa_full_causal" drops the DSAIndexer (gpt_layer_specs.py:379-384
+        # passes indexer=None), which is exactly the phase-1 shape: nothing to
+        # train.
         with self.assertRaisesRegex(ValueError, "build at least one Indexer"):
             _make_mqa_config(
                 train_indexer_only=True,
@@ -162,8 +188,9 @@ class TestPhase2ConfigValidation(unittest.TestCase):
 
     def test_mqa_without_hybrid_layer_rejected(self):
         # ``hybrid_mla_attention`` only does anything to ``-2`` layers; without
-        # one there is no MQALatentAttention and therefore no DSAIndexer. That
-        # is now caught earlier and more precisely, by the unconditional
+        # one nothing dispatches to MHADSAWarmupAttention / MQALatentAttention
+        # and therefore no DSAIndexer is built (gpt_layer_specs.py:368-398).
+        # That is now caught earlier and more precisely, by the unconditional
         # ``hybrid_mla_attention`` guard, rather than by the
         # ``train_indexer_only`` "build at least one Indexer" check.
         with self.assertRaisesRegex(ValueError, "only applies to MLA layers"):
@@ -229,6 +256,43 @@ class TestKeepIndexerGradPath(unittest.TestCase):
     def test_non_tensor_passthrough(self):
         config = _make_dsv4_config(train_indexer_only=True)
         self.assertIsNone(keep_indexer_grad_path(None, config))
+
+    def test_gating_is_train_indexer_only_and_nothing_else(self):
+        """``train_indexer_only`` alone decides; the phase must not leak in.
+
+        ``recompute_utils.py:49`` is the only config read in the whole function,
+        so the anchor must appear for every config that sets the flag, whatever
+        Indexer kind or attention backend the rest of the config selects. Pinned
+        explicitly because phase 2 moved the ``-2`` layers from latent MQA to
+        ``MHADSAWarmupAttention``, changing which class sits inside the
+        recompute segment; a future "only for backend X" shortcut here would
+        reintroduce the silent zero-gradient bug for the other one.
+
+        ``dsa_indexer_use_sparse_loss=True`` is only illegal *together with*
+        ``train_indexer_only`` on a ``-2`` layer (transformer_config.py:1656,
+        :1666), so the CSA-shaped ``_make_dsv4_config`` is what makes the
+        sparse-flag half of this assertion constructible at all.
+        """
+        cases = (
+            ("csa_indexer", lambda **kw: _make_dsv4_config(**kw)),
+            (
+                "csa_indexer_sparse_loss",
+                lambda **kw: _make_dsv4_config(
+                    dsa_indexer_use_sparse_loss=True, **kw
+                ),
+            ),
+            ("mqa_dsa_warmup_indexer", lambda **kw: _make_mqa_config(**kw)),
+        )
+        for label, make in cases:
+            with self.subTest(config=label):
+                on = keep_indexer_grad_path(
+                    self.hidden, make(train_indexer_only=True)
+                )
+                self.assertIsNot(on, self.hidden)
+                self.assertFalse(on.stop_gradient)
+                self.assertIs(
+                    keep_indexer_grad_path(self.hidden, make()), self.hidden
+                )
 
 
 class _IndexerBranch(nn.Layer):
@@ -299,6 +363,10 @@ class TestAttachUnderFrozenBackbone(unittest.TestCase):
     def test_tilelang_autoscaler_forward_returns_fresh_tensor_when_frozen(self):
         # Only the forward contract is checked here: the backward needs the
         # TileLang/cuDNN indexer kernels, which single-card CPU tests skip.
+        # This PyLayer is shared by both indexer-bearing backends -- phase 3's
+        # ``MQALatentAttention`` and phase 2's ``MHADSAWarmupAttention``, which
+        # imports the same symbol from ``csa_attention`` -- so one forward-shape
+        # guard covers the frozen-backbone contract for the whole family.
         output = paddle.randn([2, 4, 8])
         output.stop_gradient = True
         index_q = paddle.randn([2, 4, 8])
@@ -311,14 +379,18 @@ class TestAttachUnderFrozenBackbone(unittest.TestCase):
         topk_probs = paddle.rand([2, 4, 2])
         target = paddle.rand([2, 4, 2])
 
+        # Positional order is the real one (csa_attention.py:1205-1218):
+        # output, target, index_q, weights, index_k_comp, topk_indices,
+        # topk_probs, loss_coeff. It matters even for a forward-only check,
+        # because ``num_rows`` is derived from ``target.shape``.
         attached = TileLangCSAIndexerLossAutoScaler.apply(
             output,
+            target,
             index_q,
             weights,
             index_k,
             topk_indices,
             topk_probs,
-            target,
             0.01,
         )
         self.assertIsNot(attached, output)

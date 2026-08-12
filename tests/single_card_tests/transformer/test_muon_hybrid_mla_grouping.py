@@ -238,7 +238,15 @@ _EXPECTED_EXCLUDE_PATTERNS = ["embed", "bias", "lm_head", "mlp.gate", "ape"]
 
 
 class TestMqaDsaRouting(unittest.TestCase):
-    """The phase-2 config: latent MQA + DSA indexer + sink."""
+    """The phase-2 config: dense warmup MHA + DSA indexer + sink.
+
+    (WAS "latent MQA + DSA indexer + sink". Phase 2 has no top-k on either side
+    and now runs phase 1's dense attention -- ``MHADSAWarmupAttention`` --
+    instead of the block-sparse latent MQA. Muon routing keys off parameter
+    names only, and the two phases own byte-identical parameter sets, so nothing
+    below changes; see ``test_mqa_dsa_adds_exactly_the_indexer`` and
+    ``test_sparse_loss_phase_matches_warmup_phase``.)
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -413,8 +421,21 @@ class TestModeDifferences(unittest.TestCase):
     def test_sparse_loss_phase_matches_warmup_phase(self):
         """dsa_indexer_use_sparse_loss changes the attention/loss shape, never
         the optimizer routing.
+
+        Since the flag also selects the core-attention *class* (phase 2 dense
+        ``MHADSAWarmupAttention`` vs phase 3 ``MQALatentAttention``,
+        ``hybrid_mla_indexer.latent_mqa_enabled``), assert the parameter names
+        themselves are equal first: that is the property the HF-checkpoint stage
+        switch rests on, and Muon routing is a function of those names.
         """
         warm, sparse = self.envs[_DSA_CFG], self.envs[_DSA_SPARSE_LOSS_CFG]
+        self.assertEqual(set(sparse.params), set(warm.params))
+        self.assertEqual(
+            type(warm.attn.core_attention).__name__, "MHADSAWarmupAttention"
+        )
+        self.assertEqual(
+            type(sparse.attn.core_attention).__name__, "MQALatentAttention"
+        )
         self.assertEqual(sparse.muon, warm.muon)
         self.assertEqual(sparse.adamw, warm.adamw)
         self.assertEqual(

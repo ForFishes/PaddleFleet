@@ -18,13 +18,24 @@ Adversarial gradient validation of ``hybrid_mla_attention`` for the hybrid-MLA
 layer (csa ratio == -2, experimental_attention_variant == "dsv4_hybrid").
 
   * ``"mha"``     -- dense MLA (MLASelfAttention + DotProductAttention).
-  * ``"mqa_dsa"`` -- latent MQA: runtime activation-level absorption on the
-      shared KV latent PLUS a cuDNN block-sparse DSA indexer (gpt_layer_specs
-      always builds the indexer for such a layer). With the forced local window
-      (``csa_window_size``) >= sequence length the indexer selects no extra
-      tokens, so the absorbed path degenerates to full per-document causal
-      attention -- mathematically equal to the dense MHA phase, which is what
-      the equivalence items below rely on.
+  * ``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=True`` (phase 3/4) -- latent
+      MQA: runtime activation-level absorption on the shared KV latent PLUS a
+      cuDNN block-sparse DSA indexer (gpt_layer_specs always builds the indexer
+      for such a layer). With the forced local window (``csa_window_size``) >=
+      sequence length the indexer selects no extra tokens, so the absorbed path
+      degenerates to full per-document causal attention -- mathematically equal
+      to the dense MHA phase, which is what the equivalence items below rely on.
+  * ``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=False`` (phase 2, DSA warmup)
+      -- ``MHADSAWarmupAttention``: phase 1's dense MHA with the indexer's
+      full-candidate KL bolted on. The warmup phase has no top-k on either side,
+      so there is nothing for latent MQA to absorb and no block-sparse kernel is
+      involved. The predicate is ``hybrid_mla_indexer.latent_mqa_enabled``.
+
+``sparse_loss`` therefore selects the attention *backend*, not merely the loss
+width. ``_build`` defaults it to ``True`` so the equivalence / magnitude /
+sink / stress / stability items keep measuring the latent path they were
+written for; item 10 (the indexer KL at its production phase-2 setting) passes
+``False``, and item 4 walks all three backends.
 
 The old 3-state ``hybrid_mla_attn_mode`` {mha, mqa, mqa_dsa} became the
 ``hybrid_mla_attention`` enum. Only two of its values are exercised here: "mha"
@@ -85,6 +96,10 @@ from paddlefleet.models.gpt.gpt_layer_specs import (
 from paddlefleet.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
+from paddlefleet.transformer.hybrid_mla_indexer import latent_mqa_enabled
+from paddlefleet.transformer.mha_dsa_warmup_attention import (
+    MHADSAWarmupAttention,
+)
 from paddlefleet.transformer.multi_latent_attention import (
     MLASelfAttention,  # noqa: F401  (import forces hybrid_mla_* field registration)
 )
@@ -137,11 +152,21 @@ class _FakePGCollection:
 # == 0, kv_lora_rank 512 + qk_rope 64 == 576 latent key width, v == 512.
 # --------------------------------------------------------------------------- #
 def _make_config(
-    mode, sink, indexer=False, dtype=paddle.bfloat16, split_kv_b=False
+    mode,
+    sink,
+    indexer=False,
+    dtype=paddle.bfloat16,
+    split_kv_b=False,
+    sparse_loss=True,
 ):
     # ``indexer`` is vestigial: the hybrid-MLA layer's DSA indexer is now built
     # unconditionally for ``hybrid_mla_attention="mqa_dsa"`` (see
     # gpt_layer_specs), so it is retained only for call-site compatibility.
+    #
+    # ``sparse_loss`` (``dsa_indexer_use_sparse_loss``) is the phase switch of
+    # ``"mqa_dsa"`` and picks the attention backend as well as the KL width:
+    # ``True`` -> latent MQA (phase 3/4), ``False`` -> the dense
+    # ``MHADSAWarmupAttention`` of phase 2. Ignored by ``mode="mha"``.
     del indexer
     hybrid_mla_attention = "mha" if mode == "mha" else "mqa_dsa"
     cfg = TransformerConfig(
@@ -187,7 +212,7 @@ def _make_config(
         dsa_index_head_dim=128,
         dsa_index_topk=128,
         dsa_indexer_loss_coeff=1.0,
-        dsa_indexer_use_sparse_loss=False,
+        dsa_indexer_use_sparse_loss=sparse_loss,
         dsa_indexer_rotary_interleaved=False,
         apply_rope_fusion=False,
         attention_dropout=0.0,
@@ -209,35 +234,56 @@ def _build(
     indexer=False,
     dtype=paddle.bfloat16,
     split_kv_b=False,
+    sparse_loss=True,
 ):
     """Build the layer-0 (hybrid-MLA) self-attention for ``mode``."""
     model_parallel_cuda_manual_seed(_SEED)
-    cfg = _make_config(mode, sink, indexer, dtype=dtype, split_kv_b=split_kv_b)
+    cfg = _make_config(
+        mode,
+        sink,
+        indexer,
+        dtype=dtype,
+        split_kv_b=split_kv_b,
+        sparse_loss=sparse_loss,
+    )
     spec = get_gpt_layer_local_spec(
         config=cfg,
         normalization=cfg.normalization,
         layer_number=0,
     ).sublayers_spec.self_attn
-    with _fa4_for_mha_sink(mode, sink):
+    with _fa4_for_dense_sink(cfg):
         module = build_spec_layer(
             spec, config=cfg, layer_number=0, pg_collection=_FakePGCollection()
         )
     return module
 
 
-@contextlib.contextmanager
-def _fa4_for_mha_sink(mode, sink):
-    """Satisfy the ``mha`` + sink FA4 requirement for the duration of a build.
+def _uses_latent_mqa(mode, sparse_loss=True, **_ignored):
+    """Whether ``_build`` yields the absorbed latent-MQA backend.
 
-    ``MultiLatentAttention.__init__`` refuses to create the sink for ``mha``
-    unless ``FLAGS_flash_attn_version in (3, 4)``, because ``mha`` consumes it as
-    ``flashmask_attention_func(learnable_sink=...)`` which only exists on the
-    cute path (multi_latent_attention.py, guard next to the parameter creation).
+    Routed through the production predicate instead of re-deriving the rule, so
+    a fixture can never disagree with ``gpt_layer_specs``' dispatch.
+    """
+    return latent_mqa_enabled(
+        _make_config(mode, sink=False, sparse_loss=sparse_loss)
+    )
+
+
+@contextlib.contextmanager
+def _fa4_for_dense_sink(cfg):
+    """Satisfy the dense-MLA + sink FA4 requirement for the duration of a build.
+
+    ``MultiLatentAttention.__init__`` refuses to create the sink unless
+    ``FLAGS_flash_attn_version in (3, 4)`` whenever the layer is *not* latent
+    MQA (multi_latent_attention.py:584-607), because the dense path consumes it
+    as ``flashmask_attention_func(learnable_sink=...)`` which only exists on the
+    cute path. That now covers two phases, not one: phase 1 (``"mha"``) and the
+    phase-2 DSA warmup, which deliberately inherits every phase-1 constraint.
     The default flag value in this image is 2. These tests only inspect the
     parameter, so we flip the flag around construction and restore it -- the
     process-global default must stay untouched for the other suites.
     """
-    if not (sink and mode == "mha"):
+    if not (cfg.add_full_attention_sink_bias and not latent_mqa_enabled(cfg)):
         yield
         return
     previous = paddle.get_flags(["FLAGS_flash_attn_version"])[
@@ -250,12 +296,17 @@ def _fa4_for_mha_sink(mode, sink):
         paddle.set_flags({"FLAGS_flash_attn_version": previous})
 
 
-# Modes exercised here, as (label, vestigial ``indexer`` argument). Only two of
-# the three ``hybrid_mla_attention`` values are relevant to gradient health:
-# ``"mha"`` and ``"mqa_dsa"`` (which always builds the indexer). The
-# indexer-less ``"mqa_full_causal"`` is a non-production equivalence experiment,
-# so its redundant entry was dropped.
-_MODES = (("mha", False), ("mqa_dsa", True))
+# The three hybrid-MLA backends reachable from this fixture, as
+# ``(label, _build kwargs)``. ``"mqa_dsa"`` is two backends now rather than one:
+# ``dsa_indexer_use_sparse_loss`` picks the attention as well as the loss width,
+# so the warmup phase runs phase 1's dense MHA (``MHADSAWarmupAttention``) and
+# only the sparse phase runs latent MQA. The indexer-less ``"mqa_full_causal"``
+# is a non-production equivalence experiment covered elsewhere.
+_MODES = (
+    ("mha", {"mode": "mha"}),
+    ("mqa_dsa_warmup", {"mode": "mqa_dsa", "sparse_loss": False}),
+    ("mqa_dsa_sparse", {"mode": "mqa_dsa", "sparse_loss": True}),
+)
 
 # Parameters we expect to carry gradient in the hybrid-MLA layer (weights only;
 # the sink is handled separately because mha's is inert here, see item 3).
@@ -786,12 +837,19 @@ class TestItem3SinkGradient(unittest.TestCase):
 @_skip_if_no_cuda
 class TestItem4GradientFlowCompleteness(unittest.TestCase):
     """Item 4: every parameter that should receive a gradient does -- no None,
-    no all-zero -- in all reachable modes, sink on and off."""
+    no all-zero -- in all reachable backends, sink on and off.
+
+    "All reachable backends" is three, not two, since the phase split: dense
+    phase 1 (``"mha"``), the dense phase-2 DSA warmup
+    (``MHADSAWarmupAttention``) and latent MQA (phase 3/4). Only the last one
+    needs the SM100+ block-sparse kernel; the warmup phase runs wherever phase 1
+    runs, which is the point of it being phase 1's attention.
+    """
 
     SEQ = 64
 
-    def _check(self, mode, sink, indexer):
-        m = _build(mode, sink=sink, indexer=indexer)
+    def _check(self, sink, **build_kwargs):
+        m = _build(sink=sink, **build_kwargs)
         _, g = _grads(
             m, _hidden(self.SEQ, seed=2), _row_end(self.SEQ), weighted=True
         )
@@ -814,23 +872,26 @@ class TestItem4GradientFlowCompleteness(unittest.TestCase):
         return missing, dead, sink_state
 
     def test_all_weight_params_receive_gradient(self):
-        for mode, idx in _MODES:
-            if mode == "mqa_dsa" and not _HAS_DSA:
+        for label, kwargs in _MODES:
+            latent = _uses_latent_mqa(**kwargs)
+            if latent and not _HAS_DSA:
                 continue
             for sink in (False, True):
-                if mode == "mha" and sink:
-                    # mha + sink cannot run here (FA4 cute kernel absent); the
-                    # forward raises.  Documented under item 3; skip flow check.
+                if sink and not latent:
+                    # A dense MLA sink cannot run here (FA4 cute kernel
+                    # absent); the forward raises. That covers ``"mha"`` and the
+                    # phase-2 warmup alike -- the warmup phase inherits phase
+                    # 1's constraints deliberately. Documented under item 3.
                     continue
-                with self.subTest(mode=mode, sink=sink):
-                    missing, dead, sink_state = self._check(mode, sink, idx)
-                    self.assertEqual(missing, [], f"{mode}: missing grads")
-                    self.assertEqual(dead, [], f"{mode}: all-zero grads")
-                    if sink and mode != "mha":
+                with self.subTest(backend=label, sink=sink):
+                    missing, dead, sink_state = self._check(sink, **kwargs)
+                    self.assertEqual(missing, [], f"{label}: missing grads")
+                    self.assertEqual(dead, [], f"{label}: all-zero grads")
+                    if sink:
                         self.assertEqual(
                             sink_state,
                             "live",
-                            f"{mode}: sink got no usable gradient",
+                            f"{label}: sink got no usable gradient",
                         )
 
 
@@ -1032,22 +1093,36 @@ class TestItem8WeightDecayInteraction(unittest.TestCase):
 
 @_skip_if_no_cuda
 class TestItem9InputIdsReachTheIndexerLossMask(unittest.TestCase):
-    """``input_ids`` must reach the MQA core attention, and only that one.
+    """``input_ids`` must reach an indexer-owning core attention, and no other.
 
     The indexer-loss row mask has to come from ``input_ids != pad_token_id``:
     ``attn_mask_startend_row_indices`` folds a packed sequence's trailing
     padding into the last document, so the document metadata alone reports those
     rows as valid. ``MultiLatentAttention.forward`` therefore forwards
-    ``input_ids`` to ``core_attention`` -- but only under ``mqa_latent``, since
+    ``input_ids`` to ``core_attention`` -- but only when the core attention
+    advertises ``accepts_input_ids`` (multi_latent_attention.py:945-950), since
     ``DotProductAttention.forward`` has no such parameter and no ``**kwargs``.
+
+    That capability flag, not ``mqa_latent``, is the gate: BOTH indexer-owning
+    phases need the mask (``HybridMLAIndexerMixin.accepts_input_ids = True``,
+    hybrid_mla_indexer.py:76) while only phase 3/4 absorbs, so the phase-2 dense
+    warmup backend must be covered here too -- it is the phase that actually
+    runs packed sequences with a padded tail in production.
     """
 
     SEQ = 64
 
-    def test_mqa_core_attention_receives_input_ids(self):
-        if not _HAS_DSA:
-            self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
-        module = _build("mqa_dsa")
+    def test_indexer_core_attentions_receive_input_ids(self):
+        for label, kwargs in _MODES:
+            if kwargs["mode"] == "mha":
+                continue
+            if _uses_latent_mqa(**kwargs) and not _HAS_DSA:
+                continue
+            with self.subTest(backend=label):
+                self._assert_forwarded(**kwargs)
+
+    def _assert_forwarded(self, **build_kwargs):
+        module = _build(**build_kwargs)
         seen = {}
         inner = module.core_attention.forward
 
@@ -1063,6 +1138,10 @@ class TestItem9InputIdsReachTheIndexerLossMask(unittest.TestCase):
             attention_mask=None,
             attn_mask_startend_row_indices=_row_end(self.SEQ),
             input_ids=input_ids,
+        )
+        self.assertTrue(
+            getattr(module.core_attention, "accepts_input_ids", False),
+            "an indexer-owning core attention must accept input_ids",
         )
         self.assertIsNotNone(seen["input_ids"])
         self.assertEqual(list(seen["input_ids"].shape), [1, self.SEQ])
@@ -1095,13 +1174,19 @@ class TestItem10IndexerKLValueAndDenominator(unittest.TestCase):
         divides by too) equals the non-pad token count, so forward and backward
         agree;
       * the coefficient is applied exactly once (linear in coeff).
+
+    ``dsa_indexer_use_sparse_loss=False`` now also selects the *backend*, so the
+    module under test is ``MHADSAWarmupAttention`` (dense MHA + full-candidate
+    KL) rather than latent MQA. Only the construction and the spied-on module
+    change; every observable above is a property of the KL, which is why this is
+    still one test.
     """
 
     SEQ = 256
     NPAD = 48  # trailing padding folded into the last document's row range
 
     def _run_and_capture(self, coeff):
-        import paddlefleet.transformer.mqa_latent_attention as mqamod
+        import paddlefleet.transformer.mha_dsa_warmup_attention as warmupmod
         from paddlefleet.transformer.dsa_attention import (
             DSAIndexerLossLoggingHelper as LOG,
         )
@@ -1109,13 +1194,14 @@ class TestItem10IndexerKLValueAndDenominator(unittest.TestCase):
         cap = {}
         # Phase 2 attaches its indexer loss through the shared
         # ``TileLangCSAIndexerLossAutoScaler`` PyLayer (imported into
-        # ``mqa_latent_attention`` from ``csa_attention``), with the
-        # ``"tilelang"`` backend tag. One spy on that boundary carries every
-        # observable this test needs -- ``P`` (``topk_probs``, already softmaxed
-        # by ``csa_indexer_topk_fwd``), ``Q`` (``target``), the row mask, the
+        # ``mha_dsa_warmup_attention`` from ``csa_attention``; phase 3 imports
+        # the same symbol into ``mqa_latent_attention``), with the ``tilelang``
+        # backend tag. One spy on that boundary carries every observable this
+        # test needs -- ``P`` (``topk_probs``, already softmaxed by
+        # ``csa_indexer_topk_fwd``), ``Q`` (``target``), the row mask, the
         # denominator and the coefficient -- and they are exactly the tensors the
         # tilelang ``csa_indexer_bwd`` differentiates.
-        real = mqamod.TileLangCSAIndexerLossAutoScaler
+        real = warmupmod.TileLangCSAIndexerLossAutoScaler
         # Bound by position, so pin the order: a reordered signature would hand
         # the spy the wrong tensors instead of failing.
         expected_args = [
@@ -1179,14 +1265,25 @@ class TestItem10IndexerKLValueAndDenominator(unittest.TestCase):
                     loss_mask,
                 )
 
-        module = _build("mqa_dsa")
+        module = _build("mqa_dsa", sparse_loss=False)
+        # ``dsa_indexer_use_sparse_loss=False`` is the phase-2 pair, so the
+        # backend must be the dense warmup one. Asserted on the class (and the
+        # config below), not on a ``indexer_use_sparse_loss`` attribute:
+        # ``MHADSAWarmupAttention`` has none -- the phase is a property of the
+        # config, and the backend the config selected is what the class name
+        # reports.
+        self.assertIsInstance(
+            module.core_attention,
+            MHADSAWarmupAttention,
+            "not the phase-2 backend",
+        )
+        self.assertFalse(module.config.dsa_indexer_use_sparse_loss)
         module.core_attention.indexer_loss_coeff = float(coeff)
-        module.core_attention.indexer_use_sparse_loss = False
         module.train()
         ids = np.ones((1, self.SEQ), dtype="int64")
         ids[0, self.SEQ - self.NPAD :] = 0  # pad_token_id == 0
         input_ids = paddle.to_tensor(ids)
-        mqamod.TileLangCSAIndexerLossAutoScaler = Spy
+        warmupmod.TileLangCSAIndexerLossAutoScaler = Spy
         LOG.clean_loss_in_tracker()
         try:
             module(
@@ -1198,13 +1295,16 @@ class TestItem10IndexerKLValueAndDenominator(unittest.TestCase):
                 input_ids=input_ids,
             )
         finally:
-            mqamod.TileLangCSAIndexerLossAutoScaler = real
+            warmupmod.TileLangCSAIndexerLossAutoScaler = real
         logged = float(LOG.tracker["values"].astype("float32").sum())
         return logged, cap
 
     def test_kl_value_denominator_and_coeff(self):
         if not _HAS_DSA:
-            self.skipTest("absorbed MQA forward requires SM100+ DSA kernel")
+            # The phase-2 attention itself is plain dense flashmask, but its KL
+            # runs the tilelang indexer kernels. ``is_dsa_available`` is the
+            # available proxy for "an SM100+ box with those kernels built".
+            self.skipTest("the tilelang indexer KL requires an SM100+ box")
         logged, cap = self._run_and_capture(coeff=0.01)
         nonpad = float(self.SEQ - self.NPAD)
 

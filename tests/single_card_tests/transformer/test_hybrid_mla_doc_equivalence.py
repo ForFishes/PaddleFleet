@@ -350,8 +350,11 @@ class TestWindowIndexerPartitionMetadata(unittest.TestCase):
                 window = _build_window_topk_idxs_from_doc_bounds(
                     1, seqlen, WINDOW, doc_start, is_valid
                 ).numpy()
+                # ``window`` is a required positional arg on
+                # ``HybridMLAIndexerMixin._indexer_valid_range``; it used to
+                # default to ``self.window_size``, which is ``WINDOW`` here.
                 vr, row_empty = self.module._indexer_valid_range(
-                    seqlen, doc_start, doc_len, is_valid
+                    seqlen, doc_start, doc_len, is_valid, WINDOW
                 )
                 vr = vr.numpy()[0]
                 row_empty = row_empty.numpy().reshape([seqlen])

@@ -82,7 +82,12 @@ from paddlefleet.transformer.gated_delta_net import (
     GatedDeltaNet,
     GatedDeltaNetSublayersSpec,
 )
+from paddlefleet.transformer.hybrid_mla_indexer import latent_mqa_enabled
 from paddlefleet.transformer.identity_op import IdentityOp
+from paddlefleet.transformer.mha_dsa_warmup_attention import (
+    MHADSAWarmupAttention,
+    MHADSAWarmupAttentionSublayersSpec,
+)
 from paddlefleet.transformer.mlp import MLP, MLPSublayersSpec
 from paddlefleet.transformer.mqa_latent_attention import (
     MQALatentAttention,
@@ -113,6 +118,26 @@ from paddlefleet.transformer.paddle_norm import (
 )
 
 LNImpl = WrappedPaddleNorm
+
+
+def _hybrid_mla_indexer_spec(backend) -> LayerSpec:
+    """``DSAIndexer`` spec for the ``csa_compress_ratios == -2`` layers.
+
+    Shared by the two DSA core attentions of a hybrid MLA run -- phase 2's
+    ``MHADSAWarmupAttention`` and phase 3's ``MQALatentAttention`` -- so that the
+    indexer parameter names and shapes cannot drift between the phases an HF
+    checkpoint moves through.
+    """
+    return LayerSpec(
+        layer=DSAIndexer,
+        sublayers_spec=DSAIndexerSublayersSpec(
+            linear_wq_b=backend.linear(),
+            linear_wk=backend.linear(),
+            k_norm=paddle.nn.LayerNorm,
+            linear_weights_proj=backend.linear(),
+        ),
+        extra_kwargs={"is_hybrid_mla_indexer": True},
+    )
 
 
 def _get_effective_mtp_layers(config: TransformerConfig) -> int:
@@ -340,7 +365,7 @@ def get_attention_spec(
             and getattr(config, "dsa_index_n_heads", None) is not None
         )
 
-        if hybrid_mla_attention in ("mqa_dsa", "mqa_full_causal"):
+        if latent_mqa_enabled(config):
             # Latent MQA core attention on the KV latent; parameters stay
             # byte-identical to MHA so an MHA checkpoint loads unchanged. The
             # DSA indexer is what makes this mode worth running, so it is only
@@ -352,19 +377,21 @@ def get_attention_spec(
                 layer=MQALatentAttention,
                 sublayers_spec=MQALatentAttentionSublayersSpec(
                     indexer=(
-                        None
-                        if dense_mqa
-                        else LayerSpec(
-                            layer=DSAIndexer,
-                            sublayers_spec=DSAIndexerSublayersSpec(
-                                linear_wq_b=backend.linear(),
-                                linear_wk=backend.linear(),
-                                k_norm=paddle.nn.LayerNorm,
-                                linear_weights_proj=backend.linear(),
-                            ),
-                            extra_kwargs={"is_hybrid_mla_indexer": True},
-                        )
+                        None if dense_mqa else _hybrid_mla_indexer_spec(backend)
                     ),
+                ),
+            )
+        elif hybrid_mla_attention == "mqa_dsa":
+            # Phase 2 (DSA warmup). No top-k on either side, so the attention is
+            # phase 1's dense MHA verbatim: absorbing into latent MQA here would
+            # only push a zero-sparsity ``[b, s, s]`` index table through the
+            # block-sparse kernel. ``latent_mqa_enabled`` above keeps this in
+            # step with the enclosing ``MLASelfAttention``, which reads the same
+            # predicate to decide whether to absorb at all.
+            core_attention = LayerSpec(
+                layer=MHADSAWarmupAttention,
+                sublayers_spec=MHADSAWarmupAttentionSublayersSpec(
+                    indexer=_hybrid_mla_indexer_spec(backend),
                 ),
             )
         elif use_dsa:

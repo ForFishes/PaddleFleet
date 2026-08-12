@@ -15,27 +15,30 @@
 """Latent MQA core attention for hybrid MLA layers, with DSA.
 
 ``hybrid_mla_attention`` selects which core attention the
-``csa_compress_ratios == -2`` (MLA) layers of a ``dsv4_hybrid`` model run, and
-within the DSA mode ``dsa_indexer_use_sparse_loss`` selects the training phase.
-``MQALatentAttention._phase()`` is the single place that is decided, and each
-phase has its own ``_forward_*`` with no loss code shared between them:
+``csa_compress_ratios == -2`` (MLA) layers of a ``dsv4_hybrid`` model run. This
+module owns the two modes that attend to the **absorbed KV latent**, i.e. the
+ones that consume a sorted candidate set:
 
-* ``"mha"`` -- unchanged dense MLA (MHA); this module is not used.
 * ``"mqa_full_causal"`` -> ``_forward_full_causal``. Latent MQA with the indexer
   dropped, attending to the full per-document causal set. Mathematically
   identical to the dense MHA phase, so it isolates the absorption from the
   sparsity for equivalence experiments; ``O(s^2)`` in index memory and therefore
   not a production mode.
-* ``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=False`` -> ``_forward_warmup``
-  (phase 2, DSA warmup, paired with ``train_indexer_only``). The backbone is
-  frozen and the indexer is random, so **neither side uses top-k**: attention
-  runs the same full per-document causal set phase 1 did, and the indexer KL
-  spans every causal column on both sides, via one ``csa_indexer_topk_fwd``
-  call in its documented "full-candidate selection" mode.
 * ``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=True`` -> ``_forward_sparse``
-  (phase 3). A forced local window plus Lightning-indexer top-k, i.e. DeepSeek
+  (phase 3/4). A forced local window plus Lightning-indexer top-k, i.e. DeepSeek
   Sparse Attention on the KV latent, with the KL restricted to that same
   selected set. This is the only phase that reads ``index_topk``.
+
+The other two modes are *not* this module, and the shared predicate
+``hybrid_mla_indexer.latent_mqa_enabled`` is what keeps the spec dispatch and
+``MLASelfAttention.mqa_latent`` in step about that:
+
+* ``"mha"`` -- unchanged dense MLA (MHA).
+* ``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=False`` (phase 2, DSA warmup,
+  paired with ``train_indexer_only``) -- also dense MHA, plus the indexer, in
+  ``mha_dsa_warmup_attention.MHADSAWarmupAttention``. That phase has no top-k on
+  either side, so absorbing here would buy nothing and cost a zero-sparsity
+  ``[b, s, s]`` index table pushed through the block-sparse kernel.
 
 The indexer reuses the model-wide ``index_n_heads`` / ``index_head_dim``.
 
@@ -94,7 +97,6 @@ import paddle.nn.functional as F
 from paddle import Tensor
 from paddle.distributed.fleet.meta_parallel import LayerSpec, build_spec_layer
 
-from paddlefleet.context_parallel_utils import ContextParallelGatherOp
 from paddlefleet.process_groups_config import ProcessGroupCollection
 from paddlefleet.transformer.cp_utils import all_gather_cp
 from paddlefleet.transformer.csa_attention import (
@@ -108,6 +110,7 @@ from paddlefleet.transformer.dot_product_attention import build_softmax_offset
 from paddlefleet.transformer.dsa_attention import (
     DSAIndexerLossLoggingHelper,
 )
+from paddlefleet.transformer.hybrid_mla_indexer import HybridMLAIndexerMixin
 from paddlefleet.transformer.layer import FleetLayer
 
 if TYPE_CHECKING:
@@ -162,7 +165,7 @@ class MQALatentAttentionSublayersSpec:
     indexer: LayerSpec | type = None
 
 
-class MQALatentAttention(FleetLayer):
+class MQALatentAttention(HybridMLAIndexerMixin, FleetLayer):
     """Sparse attention on the absorbed MLA KV latent (``core_attention``).
 
     Consumes the pre-absorbed ``query`` / ``key`` produced by
@@ -196,33 +199,7 @@ class MQALatentAttention(FleetLayer):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
 
-        # CP state, same derivation as csa_attention.py:2079-2090.
-        cp_pg = pg_collection.cp if pg_collection is not None else None
-        if cp_pg is not None and getattr(cp_pg, "nranks", 1) > 1:
-            self.cp_group = cp_pg
-            self.cp_size = cp_pg.nranks
-            self.cp_rank = cp_pg.rank
-            self.cp_enabled = True
-            # Deliberately the *same* constraint the HCA layers of this model
-            # assert (dsv4_hybrid_attention.py:607-611), not a weaker one: the
-            # contiguous layout is what makes "build the index table over the
-            # global sequence, then row-slice this rank's queries" correct, and
-            # it is what makes the all-gathered KV land in natural global order.
-            if (
-                getattr(config, "cp_balance_mode", None)
-                != "contiguous_allgather"
-            ):
-                raise NotImplementedError(
-                    "latent MQA under context parallel requires "
-                    "cp_balance_mode='contiguous_allgather' (the same mode the "
-                    "hybrid model's HCA layers require), got "
-                    f"{getattr(config, 'cp_balance_mode', None)!r}."
-                )
-        else:
-            self.cp_group = None
-            self.cp_size = 1
-            self.cp_rank = 0
-            self.cp_enabled = False
+        self._init_hybrid_mla_cp_state(config, pg_collection)
 
         # ``k_channels`` is the MHA q_head_dim (qk_nope + qk_rope), NOT the 576
         # latent width: absorption is exactly score-preserving, so the MHA
@@ -286,22 +263,8 @@ class MQALatentAttention(FleetLayer):
         # when ``softmax_offset`` exists; a sinkless layer has no sink gradient.
         self.sink_grad_fusion = getattr(config, "dsa_sink_grad_fusion", False)
 
-    def _needs_indexer_loss(self) -> bool:
-        """Whether this forward should build and attach the indexer loss.
-
-        Both DSA phases share this predicate. ``paddle.is_grad_enabled()`` is
-        what makes the loss count exactly once under recompute: the first
-        (no-grad) forward only materialises the attention columns, the second one
-        attaches the loss.
-        """
-        return (
-            self.training
-            and paddle.is_grad_enabled()
-            and self.indexer_loss_coeff > 0
-        )
-
     def _phase(self) -> str:
-        """Which of the three training phases this layer runs.
+        """Which of the two phases this layer runs.
 
         The single place the phase is decided, so the attention candidate set
         and the indexer-loss shape cannot disagree:
@@ -310,12 +273,17 @@ class MQALatentAttention(FleetLayer):
           (``hybrid_mla_attention="mqa_full_causal"``, and the
           absorption-equivalence unit tests). Per-document full causal
           attention, no indexer loss.
-        * ``"warmup"`` -- phase 2 (DSA warmup). The indexer exists but is still
-          being learned, so attention must not consume its ranking: full causal
-          attention, and the KL runs over the *full* causal set on both sides.
-          No top-k anywhere.
-        * ``"sparse"`` -- phase 3. Attention consumes window + top-k and the
+        * ``"sparse"`` -- phase 3/4. Attention consumes window + top-k and the
           KL is restricted to that same selected set.
+
+        There is deliberately no warmup state here. Phase 2 has no top-k on
+        either side, so routing a zero-sparsity candidate set through the
+        block-sparse kernel would cost a full ``[b, s, s]`` index table for
+        nothing; it runs the dense MHA of phase 1 instead, in
+        ``mha_dsa_warmup_attention.MHADSAWarmupAttention``, and
+        ``hybrid_mla_indexer.latent_mqa_enabled`` is what keeps the spec
+        dispatch and ``MLASelfAttention.mqa_latent`` from ever building this
+        class for it.
 
         Read live rather than cached in ``__init__``: a test flipping
         ``indexer_use_sparse_loss`` on a live module must not be able to
@@ -323,7 +291,14 @@ class MQALatentAttention(FleetLayer):
         """
         if self.indexer is None:
             return "full_causal"
-        return "sparse" if self.indexer_use_sparse_loss else "warmup"
+        if not self.indexer_use_sparse_loss:
+            raise ValueError(
+                "MQALatentAttention has an indexer but "
+                "dsa_indexer_use_sparse_loss=False; that is the DSA warmup "
+                "phase, which runs dense MHA in MHADSAWarmupAttention. "
+                "latent_mqa_enabled() should have dispatched there."
+            )
+        return "sparse"
 
     def forward(
         self,
@@ -454,23 +429,6 @@ class MQALatentAttention(FleetLayer):
                 s_global,
             )
 
-        if phase == "warmup":
-            return self._forward_warmup(
-                query,
-                kv,
-                x,
-                qr,
-                v_b_proj_weight,
-                doc_start,
-                doc_len,
-                is_valid,
-                kv_lora_rank,
-                input_ids,
-                position_offset,
-                s,
-                s_global,
-            )
-
         return self._forward_sparse(
             query,
             kv,
@@ -508,9 +466,11 @@ class MQALatentAttention(FleetLayer):
         dense MHA phase and is bit-identical across repeated calls (nothing
         here depends on a top-k tie-break).
 
-        Used by two phases -- ``hybrid_mla_attention="mqa_full_causal"``, and
-        the attention half of the phase-2 warmup, which must not consume the
-        indexer's ranking while the indexer is still being learned.
+        Used by ``hybrid_mla_attention="mqa_full_causal"`` (the MHA -> MQA
+        equivalence isolation) and by the absorption unit tests. The DSA warmup
+        phase, which also needs a full-causal attention, does *not* come here:
+        it keeps the dense MHA backend instead, because at zero sparsity the
+        ``[b, s, s]`` index table below buys nothing.
         """
         b = int(query.shape[0])
         token_indices = self._build_full_causal_indices(
@@ -520,186 +480,6 @@ class MQALatentAttention(FleetLayer):
             query, kv, token_indices, self.softmax_scale, kv_lora_rank
         )
         return self._deabsorb(core_out, v_b_proj_weight, self.split_kv_b)
-
-    # ------------------------------------------------------------------
-    # warmup (phase 2)
-    # ------------------------------------------------------------------
-    def _forward_warmup(
-        self,
-        query: Tensor,
-        kv: Tensor,
-        x: Tensor,
-        qr: Tensor,
-        v_b_proj_weight: Tensor,
-        doc_start: Tensor,
-        doc_len: Tensor,
-        is_valid: Tensor,
-        kv_lora_rank: int,
-        input_ids: Tensor | None,
-        position_offset: int,
-        s_local: int,
-        s_global: int,
-    ) -> Tensor:
-        """Phase 2: frozen backbone, full-causal attention, full-causal KL.
-
-        No top-k on either side. The two halves:
-
-        * **attention** is the same deterministic full-causal set phase 1 uses
-          (``_forward_full_causal``), so the frozen backbone sees exactly the
-          activations it was pretrained with while the indexer is still random.
-        * **the indexer** is supervised over the *whole* per-document causal
-          span, so it cannot reinforce its own initial ranking.
-
-        Both come from one tilelang call with ``topk_effective = s_global``, which
-        is the "full-candidate selection" mode ``csa_indexer_topk_fwd`` documents
-        for exactly this phase -- the CSA layers use it the same way with
-        ``topk_effective = n_compressed``. The kernel returns the softmax
-        probabilities over every candidate column plus the column ids, and the
-        head dimension never leaves the kernel; the backward is upstream's
-        ``csa_indexer_bwd`` via ``TileLangCSAIndexerLossAutoScaler``, whose
-        tilelang branch computes exactly ``(P - Q) * coeff / valid_rows``.
-
-        Recompute: the attention column table depends only on the document
-        boundaries, so the two forwards of a recompute segment are bit-identical
-        and there is no top-k tie-break to worry about. The loss is attached on
-        the grad-enabled forward only, so it is counted once; the no-grad forward
-        skips the indexer entirely rather than computing and discarding it.
-
-        CP: ``index_k`` is all-gathered to ``s_global`` inside
-        ``forward_before_topk`` and ``kv`` by the caller, ``valid_range`` is built
-        over the global sequence and row-sliced, and ``valid_rows`` is the global
-        valid-row count -- so the per-rank losses sum to the single-rank one and
-        no ``/cp_size`` correction is needed.
-        """
-        from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
-
-        output = self._forward_full_causal(
-            query,
-            kv,
-            v_b_proj_weight,
-            doc_start,
-            is_valid,
-            kv_lora_rank,
-            position_offset,
-            s_local,
-            s_global,
-        )
-        if not self._needs_indexer_loss():
-            return output
-
-        b = int(query.shape[0])
-        self._check_tilelang_indexer_support()
-        index_q, index_k, weights = self._indexer_projections(
-            x, qr, position_offset, grad_enabled=True
-        )
-        # ``DSAIndexer`` pre-bakes ``head_dim**-0.5`` into the weights, and the
-        # tilelang indexer kernels apply ``dim**-0.5`` themselves -- same
-        # convention as the cuDNN pair the sparse phase uses, and the opposite of
-        # the pure-paddle ``FusedDSAIndexerLoss`` reference, which applies none.
-        # Undo the pre-bake once, before both the forward call and the weights
-        # handed to the backward, so the two agree.
-        # Measured (validation_reports/precision_audit_20260809_022929/ops_edge):
-        # against a plain-paddle reference the un-baked weights match to
-        # max_abs 3.0e-8 / cosine 1-1.5e-13, while passing them through unscaled
-        # gives max_abs 7.5e-1 / cosine 0.62.
-        weights = weights * (float(self.indexer.head_dim) ** 0.5)
-        # ``topk_effective`` is the causal span itself. The wrapper rounds it up
-        # to a power-of-two multiple of its block internally and crops the result
-        # back to the requested width (``csa_indexer_fwd.py:430-462`` /
-        # ``csa_indexer_bwd.py:617-638``), so there is nothing to round here and
-        # no surplus ``-1`` slot to carry. Measured at
-        # s = 1/2/4/8/16/32/300/384/512/8192: the returned width equals
-        # ``s_global`` exactly, the per-row valid-slot count equals the causal
-        # length, rows sum to 1 within 9.6e-7 and the backward is finite.
-        with paddle.no_grad():
-            # No forced window in this phase, so the candidate range is the
-            # whole per-document causal span.
-            valid_range, row_empty = self._indexer_valid_range(
-                s_global,
-                doc_start,
-                doc_len,
-                is_valid,
-                position_offset,
-                s_local,
-                window=0,
-            )
-            columns, probs = csa_indexer_topk_fwd(
-                index_q.detach(),
-                index_k.detach(),
-                weights.detach(),
-                ratio=1,
-                topk_effective=s_global,
-                seq_offset=position_offset,
-                valid_range=valid_range,
-            )
-            columns = paddle.where(
-                row_empty, paddle.full_like(columns, -1), columns
-            )
-            probs = paddle.where(columns >= 0, probs, paddle.zeros_like(probs))
-            target = self._attn_target(query.detach(), kv, columns)
-            loss_mask, valid_rows = self._indexer_loss_mask(
-                input_ids, b, s_local
-            )
-            # Same reduction as ``_forward_sparse`` -- see the long comment there
-            # for why the unmasked branch's ``/cp_size`` has to sit in
-            # ``loss_coeff`` (and therefore reach the backward) rather than only
-            # in the logged scalar the way ``csa_attention`` places it.
-            loss_coeff = (
-                self.indexer_loss_coeff
-                if loss_mask is not None
-                else self.indexer_loss_coeff / self.cp_size
-            )
-            kl = (
-                target * (paddle.log(target + _EPS) - paddle.log(probs + _EPS))
-            ).sum(axis=-1)
-            if loss_mask is None:
-                loss = kl.mean() * loss_coeff
-            else:
-                loss = (kl * loss_mask).sum() / valid_rows * loss_coeff
-
-        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-            loss=loss,
-            layer_number=self.layer_number,
-            num_layers=DSAIndexerLossLoggingHelper.get_total_num_layers(
-                self.config
-            ),
-        )
-        return TileLangCSAIndexerLossAutoScaler.apply(
-            output,
-            target,
-            index_q,
-            weights,
-            index_k,
-            columns,
-            probs,
-            loss_coeff,
-            "tilelang",
-            valid_rows,
-            loss_mask,
-        )
-
-    def _check_tilelang_indexer_support(self) -> None:
-        """Fail loudly on the one tilelang indexer constraint we cannot absorb.
-
-        The top-k *width* needs no check: the wrappers round ``topk_effective``
-        up to a power-of-two multiple of their block and crop the result back
-        (``csa_indexer_fwd.py:430-462``, ``csa_indexer_bwd.py:617-638``), so any
-        causal span from 1 upwards is served -- measured at
-        s = 1/2/4/8/16/32/300/384/512/8192.
-
-        The head count is different: ``index_n_heads`` other than 64 trips the
-        kernel's warp tiling with a bare
-        ``Check failed: (m_warp * n_warp == num_warps)`` from inside tilelang
-        (measured with 8). Reject that here rather than at the launch. It is not
-        checked at config time on purpose -- that would make every
-        small-geometry unit fixture unrepresentable.
-        """
-        heads = int(self.indexer.n_heads)
-        if heads != 64:
-            raise ValueError(
-                "the tilelang indexer's warp tiling requires index_n_heads == 64 "
-                f"(measured: 8 fails inside the kernel), got {heads}."
-            )
 
     # ------------------------------------------------------------------
     # index construction / kernel plumbing
@@ -725,79 +505,6 @@ class MQALatentAttention(FleetLayer):
             indices = indices.contiguous()
         indices.stop_gradient = True
         return indices
-
-    def _indexer_projections(self, x, qr, position_offset, grad_enabled):
-        """``(index_q, index_k, weights)`` from the DSA indexer.
-
-        ``x`` / ``qr`` are always detached first: the indexer loss must never
-        flow back into the backbone, independently of whether the backbone
-        parameters are frozen. ``index_k`` comes back all-gathered to
-        ``s_global`` when CP is on (the indexer gathers the 128-wide key rather
-        than the hidden states, which is ~32x less traffic).
-
-        ``weights`` is returned exactly as ``DSAIndexer.forward_before_topk``
-        produced it, i.e. carrying ``n_heads**-0.5 * head_dim**-0.5``. Every
-        kernel-backed caller must undo the ``head_dim`` half itself, because both
-        the cuDNN and the tilelang indexer kernels re-apply ``dim**-0.5``
-        internally; only a pure-paddle evaluation of the score (as in
-        ``dsa_attention.FusedDSAIndexerLoss``) uses it unscaled.
-        """
-        x_det, qr_det = x.detach(), qr.detach()
-        if grad_enabled:
-            x_det.stop_gradient = False
-            qr_det.stop_gradient = False
-            return self.indexer.forward_before_topk(
-                x_det, qr_det, position_offset, self.cp_group
-            )
-        with paddle.no_grad():
-            return self.indexer.forward_before_topk(
-                x_det, qr_det, position_offset, self.cp_group
-            )
-
-    def _indexer_valid_range(
-        self,
-        s_global,
-        doc_start,
-        doc_len,
-        is_valid,
-        position_offset=0,
-        s_local=None,
-        window=None,
-    ):
-        """Candidate range per query, in **global token** space.
-
-        ``window`` is how many trailing causal tokens to exclude, i.e. the
-        forced local window the sparse phase adds separately: clamping the right
-        edge to ``doc_start + causal_len - window`` removes every duplicate while
-        leaving the full top-k budget for distant tokens. Because the clamped end
-        never exceeds the kernel's own causal limit, no masked ``-inf`` column can
-        enter the top-k. Defaults to ``self.csa_window_size``; the warmup phase
-        passes ``0`` because it has no forced window -- its candidate set is the
-        whole per-document causal span.
-
-        Built over the global sequence and row-sliced to this CP rank; the two
-        columns stay global token ids, which is what the kernel's
-        ``seq_offset``-aware causal bound expects.
-
-        Returns:
-            ``(valid_range [1, s_local, 2] int32, row_empty [1, s_local, 1])``.
-        """
-        if window is None:
-            window = self.window_size
-        positions = paddle.arange(s_global, dtype="int64")
-        causal_avail = paddle.minimum(positions - doc_start + 1, doc_len)
-        n_avail = paddle.clip(causal_avail - window, min=0)
-        n_avail = paddle.where(is_valid, n_avail, paddle.zeros_like(n_avail))
-        valid_range = paddle.stack(
-            [doc_start, doc_start + n_avail], axis=-1
-        ).cast("int32")
-        if s_local is not None and s_local != s_global:
-            valid_range = valid_range[
-                position_offset : position_offset + s_local
-            ]
-            n_avail = n_avail[position_offset : position_offset + s_local]
-        rows = int(valid_range.shape[0])
-        return valid_range.unsqueeze(0), (n_avail == 0).reshape([1, rows, 1])
 
     def _sparse_attn(
         self, query, kv, token_indices, sm_scale, d_v, indexer_topk=0
@@ -869,8 +576,9 @@ class MQALatentAttention(FleetLayer):
 
         The indexer is trained enough to steer attention, so both sides narrow to
         the selected set. Reached only when ``_phase() == "sparse"``, i.e.
-        ``dsa_indexer_use_sparse_loss=True``; the warmup phase has its own branch
-        and shares no loss code with this one.
+        ``dsa_indexer_use_sparse_loss=True``; the warmup phase is a different
+        class entirely (``mha_dsa_warmup_attention``) and shares no loss code
+        with this one.
 
         Recompute: the loss is attached on the grad-enabled forward only, so under
         full recompute it is counted once, on the second pass. Both passes see
@@ -897,7 +605,13 @@ class MQALatentAttention(FleetLayer):
                     :, position_offset : position_offset + s
                 ]
             valid_range, row_empty = self._indexer_valid_range(
-                s_global, doc_start, doc_len, is_valid, position_offset, s
+                s_global,
+                doc_start,
+                doc_len,
+                is_valid,
+                self.window_size,
+                position_offset,
+                s,
             )
 
         q_idx, k_idx, w_idx = self._indexer_projections(
@@ -1071,39 +785,6 @@ class MQALatentAttention(FleetLayer):
             loss_mask,
         )
 
-    def _indexer_loss_mask(self, input_ids, b, s):
-        """``([b, s] float32 row mask, its row count)`` from ``input_ids``.
-
-        ``(None, None)`` when no ``input_ids`` reached this layer (inference and
-        the direct-construction unit tests), which keeps the plain row mean.
-
-        Under CP the mask is this rank's row slice but the denominator is the
-        **global** valid-row count, so summing the per-rank losses reproduces the
-        single-rank reduction. ``input_ids`` arrives sharded unless
-        ``experimental_dataflow``, exactly as at ``csa_attention.py:2419-2428``.
-        """
-        if input_ids is None:
-            return None, None
-        pad_token_id = getattr(self.config, "pad_token_id", 0)
-        assert pad_token_id is not None, (
-            "pad_token_id must be set in config when input_ids is provided"
-        )
-        if self.cp_enabled:
-            if not getattr(self.config, "experimental_dataflow", False):
-                input_ids = ContextParallelGatherOp.apply(
-                    input_ids, axis=1, mode=self.config.cp_balance_mode
-                )
-            loss_mask_global = (
-                input_ids.reshape([b, self.cp_size * s]) != pad_token_id
-            ).astype(paddle.float32)
-            valid_rows = max(float(loss_mask_global.sum()), 1.0)
-            offset = self.cp_rank * s
-            return loss_mask_global[:, offset : offset + s], valid_rows
-        loss_mask = (input_ids.reshape([b, s]) != pad_token_id).astype(
-            paddle.float32
-        )
-        return loss_mask, max(float(loss_mask.sum()), 1.0)
-
     def _attn_target(self, query, kv, kl_columns, lse_indexer=None) -> Tensor:
         """KL target: head-summed attention probs over the indexer's own columns.
 
@@ -1130,15 +811,14 @@ class MQALatentAttention(FleetLayer):
             query: ``[1, s, h, dk]`` detached absorbed query (local rows).
             kv: ``[1, s_global, dk]`` latent keys (all-gathered under CP).
             kl_columns: ``[1, s, w]`` int32 global column ids the KL scores,
-                ``-1`` for empty slots. Column *order* is irrelevant, so the
-                warmup phase passes the indexer's score-ordered table directly.
+                ``-1`` for empty slots. Column *order* is irrelevant -- the
+                indexer's score-ordered table can be passed straight in.
             lse_indexer: ``[1, s, 64]`` float32 per-head LSE over exactly
                 ``kl_columns`` (``mqa_sparse_attn(indexer_topk=...)``). When
                 present the cuDNN score-recompute kernel does the whole thing in
-                one launch. ``None`` in the warmup phase -- its candidate set is
-                not the attention set, so no matching LSE exists -- and when the
-                budget is not one of ``_LSE_INDEXER_TOPKS``, so the Python path
-                stays as the reference and the fallback.
+                one launch. ``None`` when the budget is not one of
+                ``_LSE_INDEXER_TOPKS``, so the Python path stays as the reference
+                and the fallback.
 
         Returns:
             ``[1, s, w]`` float32 rows summing to 1 (0 for empty rows).

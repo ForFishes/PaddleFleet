@@ -52,6 +52,12 @@ continuation story:
    (``load_state_dict.py:325-327``) whose text is wrong -- the keys *are* in the
    model state dict. The current behaviour is pinned as a documented hazard, and
    the behaviour we would want is a companion ``expectedFailure``.
+5. **Phase 2 and phase 3 expose the same HF surface.** They now run *different*
+   core-attention classes (``MHADSAWarmupAttention`` vs ``MQALatentAttention``,
+   picked by ``latent_mqa_enabled``), so the key set / shapes / dtypes on disk
+   are pinned equal and a phase-2 checkpoint is loaded into a phase-3 module
+   bit-exactly. HF safetensors is the only supported phase switch, so a name
+   drift between the two classes would be an unguarded silent re-init.
 """
 
 import unittest
@@ -65,6 +71,7 @@ import paddle
 from .hybrid_mla_utils import (
     _CONFIG_DIR,
     _DSA_CFG as _DSA,
+    _DSA_SPARSE_LOSS_CFG as _DSA3,
     _MHA_CFG as _MHA,
     _PARENT_REPO_AVAILABLE,
     _add_repo_root_to_sys_path,
@@ -434,6 +441,93 @@ class TestHFRoundTrip(unittest.TestCase):
         # the tensors that actually moved.
         for key in _INDEXER_RANDOM_KEYS:
             self.assertIn(key, differ)
+
+
+@_requires_cuda
+class TestPhase2Phase3HFIdentity(unittest.TestCase):
+    """Q5: the phase-2 -> phase-3 hand-over, which is the *only* supported way
+    to switch phases (HF safetensors; DCP is out of scope by ruling).
+
+    Phase 2 no longer runs the same class as phase 3: ``latent_mqa_enabled``
+    (``hybrid_mla_indexer.py``) sends ``mqa_dsa`` +
+    ``dsa_indexer_use_sparse_loss=False`` to ``MHADSAWarmupAttention`` and
+    ``+ True`` to ``MQALatentAttention`` (``gpt_layer_specs.py`` dispatch). Two
+    different core-attention classes could easily disagree on parameter names,
+    which would break the hand-over silently -- ``_ -> key`` would re-init and
+    the rest would be an "Unexpected keys" warning. So pin the HF surface as
+    *identical*: same key set, same shapes, same dtypes, and a bit-exact
+    phase-2 -> phase-3 load.
+    """
+
+    def _emit(self, cfg_name, seed=11):
+        attn = _attn(cfg_name, seed=seed)
+        keys = {PREFIX + k for k in attn.state_dict()}
+        _, inverse = _aoa(cfg_name, indexer_init_from_scratch=True)
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hf"
+            emitted = _save_hf(
+                attn, _filter(inverse, keys, fleet_on_left=True), path
+            )
+            disk = set(_on_disk(path))
+        return attn, {e[0]: (e[1], e[2]) for e in emitted}, disk
+
+    def test_phase2_and_phase3_really_are_different_classes(self):
+        """ANTI-VACUITY: without this, the identity below could just be two
+        builds of the same class.
+        """
+        from paddlefleet.transformer.mha_dsa_warmup_attention import (
+            MHADSAWarmupAttention,
+        )
+        from paddlefleet.transformer.mqa_latent_attention import (
+            MQALatentAttention,
+        )
+
+        self.assertIsInstance(
+            _attn(_DSA, seed=11).core_attention, MHADSAWarmupAttention
+        )
+        self.assertIsInstance(
+            _attn(_DSA3, seed=11).core_attention, MQALatentAttention
+        )
+
+    def test_phase2_and_phase3_hf_surfaces_are_identical(self):
+        _, t2, disk2 = self._emit(_DSA)
+        _, t3, disk3 = self._emit(_DSA3)
+        self.assertEqual(
+            sorted(disk2), sorted(disk3), "phase-2/3 HF key sets diverged"
+        )
+        self.assertEqual(sorted(t2), sorted(t3))
+        for key in sorted(t2):
+            with self.subTest(key=key):
+                self.assertEqual(t2[key], t3[key], "shape/dtype diverged")
+        for key in _INDEXER_KEYS:
+            self.assertIn(PREFIX + key, disk2)
+            self.assertIn(PREFIX + key, disk3)
+        self.assertIn(PREFIX + "core_attention.softmax_offset", disk2)
+
+    def test_phase2_checkpoint_loads_into_phase3_bitwise(self):
+        """The hand-over itself: a warmup checkpoint must restore into the
+        sparse module exactly, indexer included (so
+        ``indexer_init_from_scratch`` has to be off, cf.
+        ``TestAddPrimitiveDiscardsTrainedIndexer``).
+        """
+        src = _attn(_DSA, seed=11)
+        dst = _attn(_DSA3, seed=99)
+        keys = {PREFIX + k for k in src.state_dict()}
+        self.assertEqual(keys, {PREFIX + k for k in dst.state_dict()})
+        _, inverse = _aoa(_DSA, indexer_init_from_scratch=True)
+        forward, _ = _aoa(_DSA3, indexer_init_from_scratch=False)
+        own = {k: v.clone() for k, v in dst.state_dict().items()}
+        differ = _diff_keys(own, src.state_dict())
+        self.assertGreaterEqual(len(differ), 8, "too few moving tensors")
+        for key in _INDEXER_RANDOM_KEYS:
+            self.assertIn(key, differ, "the indexer must actually move")
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phase2"
+            _save_hf(src, _filter(inverse, keys, fleet_on_left=True), path)
+            _load_hf(dst, _filter(forward, keys, fleet_on_left=False), path)
+        self.assertEqual(_diff_keys(dst.state_dict(), src.state_dict()), [])
+        for key, ref in src.state_dict().items():
+            self.assertEqual(dst.state_dict()[key].dtype, ref.dtype)
 
 
 @_requires_cuda

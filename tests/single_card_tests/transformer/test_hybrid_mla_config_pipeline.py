@@ -32,8 +32,15 @@ The five production ``layer43`` configs under test (43 decoder layers + 1 MTP,
                                               experiment).
 * ``..._non_absorbed_mqa_hca_dsa``         -- phase 2, ``"mqa_dsa"``
                                               (+ YAML ``train_indexer_only``).
+                                              No top-k on either side, so the
+                                              attention half is phase 1's dense
+                                              MHA (``MHADSAWarmupAttention``)
+                                              with the indexer bolted on.
 * ``..._non_absorbed_mqa_hca_dsa_sparse_loss`` -- phase 3, ``"mqa_dsa"`` with
                                               ``dsa_indexer_use_sparse_loss``.
+                                              The only config-level difference
+                                              from phase 2, and the flag that
+                                              selects latent MQA.
 * ``ernielite_layer43_mqa_hca``            -- CSA full-causal MQA
                                               (``csa_compress_ratios == -1``).
                                               NOT a hybrid-MLA config: a
@@ -199,8 +206,8 @@ class TestLayerDispatchTable(unittest.TestCase):
     def test_mha_baseline_uses_dot_product_no_indexer(self):
         self._assert_table(_MHA, "DotProductAttention", None)
 
-    def test_mqa_uses_mqa_latent_with_dsa_indexer(self):
-        """The *other* production ``"mqa_dsa"`` config dispatches identically.
+    def test_sparse_loss_uses_mqa_latent_with_dsa_indexer(self):
+        """Phase 3: ``"mqa_dsa"`` + sparse loss dispatches to latent MQA.
 
         NAME/FIXTURE HISTORY: this used to run a config called
         ``ernielite_layer43_mla_mqa_hca`` -- an indexer-less latent-MQA variant
@@ -213,12 +220,14 @@ class TestLayerDispatchTable(unittest.TestCase):
         for that config now lives in
         ``test_csa_full_causal_mqa_config_never_builds_latent_mqa``.
 
-        The property kept here is unchanged in strength: *every* production
-        config that sets ``hybrid_mla_attention="mqa_dsa"`` must dispatch to
-        ``MQALatentAttention`` + ``DSAIndexer`` on all seven ``-2`` layers. Since
-        the enum rename the second such config is the phase-3 sparse-loss one,
-        so this pins that ``dsa_indexer_use_sparse_loss`` does NOT leak into the
-        class dispatch.
+        WAS: "``dsa_indexer_use_sparse_loss`` does NOT leak into the class
+        dispatch", i.e. both ``"mqa_dsa"`` configs built ``MQALatentAttention``.
+        NO LONGER TRUE: it is now the *only* thing that selects the class on a
+        ``"mqa_dsa"`` config (``hybrid_mla_indexer.latent_mqa_enabled``), because
+        the zero-sparsity phase-2 candidate set is served by dense MHA instead.
+        The flip itself is pinned in
+        ``test_sparse_loss_flag_alone_flips_the_core_attention_class``; this test
+        keeps the phase-3 half of the table.
         """
         self._assert_table(_SPARSE_LOSS, "MQALatentAttention", "DSAIndexer")
 
@@ -256,8 +265,54 @@ class TestLayerDispatchTable(unittest.TestCase):
                 self.assertEqual(ratio, 128, f"L{li}")
         self.assertEqual(seen_minus1, list(_MINUS2_LAYERS))
 
-    def test_mqa_dsa_uses_mqa_latent_with_dsa_indexer(self):
-        self._assert_table(_DSA, "MQALatentAttention", "DSAIndexer")
+    def test_mqa_dsa_uses_dense_warmup_mha_with_dsa_indexer(self):
+        """Phase 2 dispatches to dense MHA + the DSA indexer, not latent MQA.
+
+        WAS ``self._assert_table(_DSA, "MQALatentAttention", "DSAIndexer")``.
+        Phase 2 has no top-k on either side, so routing it through the
+        block-sparse latent-MQA kernel only bought a per-document causal
+        ``[b, s, s]`` index table (256MB/layer at s=8192) that the kernel then
+        walked in full; it now runs phase 1's dense attention with the indexer
+        bolted on (``mha_dsa_warmup_attention.py:103``, dispatched at
+        ``gpt_layer_specs.py`` via ``latent_mqa_enabled``).
+        """
+        self._assert_table(_DSA, "MHADSAWarmupAttention", "DSAIndexer")
+
+    def test_sparse_loss_flag_alone_flips_the_core_attention_class(self):
+        """``dsa_indexer_use_sparse_loss`` is the whole phase-2/3 dispatch.
+
+        Both directions from one provider, so the assertion cannot pass by two
+        configs differing in some other field: ``False`` (phase 2, no top-k
+        anywhere) must give ``MHADSAWarmupAttention``, ``True`` (phase 3) must
+        give ``MQALatentAttention``, and the indexer spec and the enclosing
+        ``MLASelfAttention`` must be the same on both sides -- that is what makes
+        the phase switch a pure backend swap with no parameter rename.
+
+        This is the test that catches a dispatch regression, and it pins
+        ``hybrid_mla_indexer.latent_mqa_enabled`` (the single predicate shared by
+        the spec dispatch and ``MLASelfAttention.mqa_latent``) rather than
+        re-deriving the rule.
+        """
+        from paddlefleet.transformer.hybrid_mla_indexer import (
+            latent_mqa_enabled,
+        )
+
+        _, provider = _load_provider(_DSA)
+        self.assertEqual(provider.hybrid_mla_attention, "mqa_dsa")
+        self.assertFalse(provider.dsa_indexer_use_sparse_loss)
+        expected = {False: "MHADSAWarmupAttention", True: "MQALatentAttention"}
+        for sparse_loss, core in expected.items():
+            provider.dsa_indexer_use_sparse_loss = sparse_loss
+            self.assertIs(latent_mqa_enabled(provider), sparse_loss)
+            for li in _MINUS2_LAYERS:
+                with self.subTest(sparse_loss=sparse_loss, layer=li):
+                    ratio, attn_cls, core_cls, indexer_cls = _dispatch(
+                        provider, li
+                    )
+                    self.assertEqual(ratio, -2)
+                    self.assertEqual(attn_cls, "MLASelfAttention")
+                    self.assertEqual(core_cls, core)
+                    self.assertEqual(indexer_cls, "DSAIndexer")
 
     def test_mqa_full_causal_drops_the_indexer(self):
         """``"mqa_full_causal"`` keeps the latent MQA core, removes the indexer.
@@ -361,8 +416,10 @@ class TestSinkParameterOnRealModules(unittest.TestCase):
     """Build the real ``-2`` layer and check the learnable sink.
 
     Consumer: ``build_softmax_offset`` (dot_product_attention.py:87), called by
-    BOTH ``DotProductAttention.__init__`` (MHA phase) and
-    ``MQALatentAttention.__init__`` (the latent MQA modes). Proves the
+    ALL THREE ``-2`` core-attention classes: ``DotProductAttention.__init__``
+    (phase 1), ``MHADSAWarmupAttention`` (phase 2, via the same
+    ``DotProductAttention.__init__``) and ``MQALatentAttention.__init__``
+    (``"mqa_full_causal"`` and phase 3). Proves the
     model-wide ``add_full_attention_sink_bias`` JSON flag reaches a real bf16
     [num_heads] param at the SAME state_dict key
     (``core_attention.softmax_offset``) in both phases -- which is what keeps an
@@ -417,12 +474,16 @@ class TestSinkParameterOnRealModules(unittest.TestCase):
         )
 
     def test_mqa_and_dsa_have_trainable_bf16_per_head_sink(self):
+        # Phase 2 is dense MHA now, phase 3 latent MQA; the sink is built by the
+        # shared ``build_softmax_offset`` either way, which is the property here.
+        cores = {
+            _DSA: "MHADSAWarmupAttention",
+            _SPARSE_LOSS: "MQALatentAttention",
+        }
         for name in _MQA_DSA_CFGS:
             with self.subTest(config=name):
                 mod = self._build(name)
-                self.assertEqual(
-                    type(mod.core_attention).__name__, "MQALatentAttention"
-                )
+                self.assertEqual(type(mod.core_attention).__name__, cores[name])
                 sink = mod.core_attention.softmax_offset
                 self.assertIsNotNone(sink)
                 self.assertEqual(list(sink.shape), [64])
@@ -498,7 +559,12 @@ class TestHybridIndexerReadsModelWideIndexFields(unittest.TestCase):
         # block size).
         provider.dsa_index_n_heads = 32
         provider.dsa_index_topk = 256
-        mod = _build_real_attn(provider, _MINUS2_LAYERS[0])
+        # ``_DSA`` is phase 2 = dense MHA + sink, so the build now goes through
+        # the ``FLAGS_flash_attn_version in (3, 4)`` guard that used to apply to
+        # the baseline only (multi_latent_attention.py:587-614). Pin the
+        # production value, as ``TestSinkParameterOnRealModules._build`` does.
+        with _flash_attn_version(_production_fa_version()):
+            mod = _build_real_attn(provider, _MINUS2_LAYERS[0])
         idx = mod.core_attention.indexer
         self.assertEqual(type(idx).__name__, "DSAIndexer")
         self.assertEqual(idx.n_heads, 32)
@@ -886,9 +952,7 @@ class TestConfigDeltas(unittest.TestCase):
     # deliberate and identical in all four, so they are pinned as a group -- if
     # one variant drifts out of the group this fails.
     _YAML_COMMON_DELTA = {
-        # The MLA layers use plain RoPE; the fused path is the YaRN one.
-        "apply_rope_fusion": (True, False),
-        "dsv4_yarn_rope_fusion": (True, _MISSING),
+        "dsv4_yarn_rope_fusion": (False, _MISSING),
         # full/uniform/1 recompute instead of the selective module list.
         "recompute_granularity": ("selective", "full"),
         "recompute_method": (_MISSING, "uniform"),
@@ -896,6 +960,26 @@ class TestConfigDeltas(unittest.TestCase):
         "recompute_modules": (
             ["full_attn", "moe_gate_up", "moe_premute", "mhc_forward"],
             _MISSING,
+        ),
+        # Checkpointing / logging / accumulation knobs the *baseline* moved on
+        # after the four experiment yamls forked from it. Not this feature: the
+        # delta is identical across all four variants, including
+        # ``ernielite_layer43_mqa_hca``, which carries no ``hybrid_mla_*`` key
+        # at all. Pinned here rather than resynced in the yamls, because those
+        # files drive submitted jobs -- editing them would change run behaviour
+        # to make a test pass.
+        "enable_zero_cost_checkpoint": (True, False),
+        "flash_device_save_steps": (50, _MISSING),
+        "zcc_workers_num": (1, _MISSING),
+        "save_steps": (400, 200),
+        "save_hf_steps": (800, 200),
+        "gradient_accumulation_steps": (2, 1),
+        "global_logging_interval": (20, 10),
+        "load_process_num": (3, 8),
+        "sharding_comm_buffer_size_MB": (4096, 2048),
+        "output_dir": (
+            "./output/ernielite_pretrain8k_fleet_exp2-32",
+            "./output/ernielite_pretrain8k_fleet_exp2-13",
         ),
     }
 
@@ -905,9 +989,17 @@ class TestConfigDeltas(unittest.TestCase):
             f"./model_config_separated/conf/fleet_align/{_MHA}",
             f"./model_config_separated/conf/fleet_align/{name}",
         )
+        # ``apply_rope_fusion`` is NOT a common delta: the fused MLA RoPE kernel
+        # needs the per-head K/V that absorption never materialises, so only the
+        # *latent* variants turn it off. The downgrade lives inside
+        # ``if self.mqa_latent:`` (``multi_latent_attention.py:485-496``) and is a
+        # warning plus an eager-RoPE fallback, not a construction error -- so the
+        # DSA warmup phase, whose ``mqa_latent`` is False, keeps the baseline's
+        # fused kernel exactly like phase 1. Its own RoPE is on the independent
+        # ``dsa_indexer_rope_fusion`` (``dsa_attention.py:458-461``).
+        if name != _DSA:
+            allowed["apply_rope_fusion"] = (True, False)
         if name in _MQA_DSA_CFGS:
-            # The DSA indexer on the -2 layers only has a cuDNN backward.
-            allowed["csa_indexer_backend"] = ("tilelang", "cudnn")
             # ``indexer_init_from_scratch`` is mandatory once an indexer exists
             # (``modeling.py`` hard-errors on ``None``), so both mqa_dsa phases
             # set it -- with opposite values, which is the point: phase 2
@@ -940,6 +1032,15 @@ class TestConfigDeltas(unittest.TestCase):
         if name == _DSA:
             # Phase 2 = DSA warmup: only the indexer trains.
             allowed["train_indexer_only"] = (self._MISSING, True)
+        if name == _SPARSE_LOSS:
+            # Documentary only, and only on this config: neither phase reads it
+            # for a -2 layer (phase 2 hardcodes ``csa_indexer_topk_fwd``,
+            # ``mha_dsa_warmup_attention.py``; phase 3 hardcodes
+            # ``cudnn_indexer_topk_fwd``, ``mqa_latent_attention.py:535,586``),
+            # and the ratio-128 HCA layers set ``indexer = None``
+            # (``csa_attention.py:2038-2049``). Phase 2 therefore keeps the
+            # baseline's ``tilelang`` rather than diverging for no reason.
+            allowed["csa_indexer_backend"] = ("tilelang", "cudnn")
         return allowed
 
     @classmethod

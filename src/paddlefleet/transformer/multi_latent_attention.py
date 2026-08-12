@@ -60,6 +60,7 @@ from paddlefleet.tensor_parallel.mappings import (
 )
 from paddlefleet.transformer.attention import Attention
 from paddlefleet.transformer.enums import AttnMaskType
+from paddlefleet.transformer.hybrid_mla_indexer import latent_mqa_enabled
 from paddlefleet.transformer.transformer_config import TransformerConfig
 from paddlefleet.utils import get_pg_rank, get_pg_size
 
@@ -459,11 +460,13 @@ class MultiLatentAttention(Attention):
         # the per-head K/V produced by ``kv_b_proj`` ("runtime absorption").  This
         # keeps every parameter byte-identical to the MHA layout -- only the
         # activations change -- so an MHA checkpoint loads into an MQA run.
-        self.mqa_latent = getattr(
-            config, "experimental_attention_variant", None
-        ) == "dsv4_hybrid" and getattr(
-            config, "hybrid_mla_attention", "mha"
-        ) in ("mqa_dsa", "mqa_full_causal")
+        #
+        # Only the phases that actually consume a *sorted* candidate set absorb:
+        # the DSA warmup phase has no top-k anywhere, so it stays on the dense
+        # MHA path (``MHADSAWarmupAttention``) rather than paying for a
+        # zero-sparsity block-sparse call. ``gpt_layer_specs`` dispatches the core
+        # attention on this same predicate, so the two cannot disagree.
+        self.mqa_latent = latent_mqa_enabled(config)
         # ``mqa_split_kv_b_proj`` trades that property for speed:
         # ``kv_b_proj`` is replaced by standalone ``k_b_proj`` / ``v_b_proj``
         # absorption parameters, pre-laid-out so each side is one grouped GEMM
@@ -580,7 +583,10 @@ class MultiLatentAttention(Attention):
         # deliberately do NOT set the flag ourselves: it is process-global and
         # would switch every other (HCA / CSA) layer's kernel too.
         # Latent MQA needs neither check -- its block-sparse kernel
-        # supports the sink natively and up-casts it internally. Neither do the
+        # supports the sink natively and up-casts it internally. The DSA warmup
+        # phase is *not* latent MQA (``latent_mqa_enabled`` is False there), so
+        # it is covered by this check, deliberately: phase 2 is phase 1's dense
+        # attention and inherits phase 1's constraints. Neither do the
         # HySparse absorbed-MQA layers: ``gpt_layer_specs.py:318`` builds every
         # MLA layer as ``MQASelfAttention`` when ``enable_hy_sparse_attention``
         # is on, and for an SWA layer (``is_mqa``, :1919) that subclass runs the
@@ -610,9 +616,13 @@ class MultiLatentAttention(Attention):
                     f"FLAGS_flash_attn_version={fa_version} (only 3 or 4 reach "
                     "that path). Either export FLAGS_flash_attn_version=4 "
                     "(NOTE: process-global -- it changes the HCA/CSA layers' "
-                    "kernel as well), or run the hybrid MLA layers with "
-                    "hybrid_mla_attention='mqa_dsa' / 'mqa_full_causal', whose "
-                    "block-sparse kernel supports the sink natively."
+                    "kernel as well), or run the hybrid MLA layers on the "
+                    "absorbed latent MQA, whose block-sparse kernel supports "
+                    "the sink natively: hybrid_mla_attention="
+                    "'mqa_full_causal', or 'mqa_dsa' with "
+                    "dsa_indexer_use_sparse_loss=True. 'mqa_dsa' with "
+                    "dsa_indexer_use_sparse_loss=False (the DSA warmup phase) "
+                    "is *this* dense path by design and does not escape it."
                 )
             if "bfloat16" not in str(self.config.params_dtype):
                 raise RuntimeError(
@@ -940,10 +950,15 @@ class MultiLatentAttention(Attention):
 
         # The indexer-loss row mask needs ``input_ids``: the packed sequence's
         # trailing padding is invisible to ``attn_mask_startend_row_indices``.
-        # Only the non-absorbed-MQA core attention accepts it (and only that one
-        # owns an indexer), so keep the kwarg off every other core attention.
+        # Asked of the core attention itself rather than derived from
+        # ``mqa_latent``, because both hybrid MLA phases with an indexer want it
+        # while only one of them absorbs -- and no core attention may be handed a
+        # kwarg it does not accept.
         core_attn_extra = {}
-        if self.mqa_latent and kwargs.get("input_ids") is not None:
+        if (
+            getattr(self.core_attention, "accepts_input_ids", False)
+            and kwargs.get("input_ids") is not None
+        ):
             core_attn_extra["input_ids"] = kwargs["input_ids"]
 
         if self.mqa_latent:

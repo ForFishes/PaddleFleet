@@ -12,37 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Context parallel for the DSA **warmup** phase, and for padded layouts.
+"""Context parallel for the DSA **warmup** phase (phase 2), and for padded
+layouts.
 
-Two gaps in ``test_mqa_dsa_cp.py`` / ``test_mla_cp_contiguous_allgather.py``:
+Phase 2 is ``hybrid_mla_attention="mqa_dsa"`` with
+``dsa_indexer_use_sparse_loss=False``: no top-k on either side. It is no longer
+latent MQA -- ``hybrid_mla_indexer.latent_mqa_enabled`` returns False for it
+(``hybrid_mla_indexer.py:59-60``), so the spec builds
+:class:`MHADSAWarmupAttention`, which delegates its whole attention half to
+``DotProductAttention.forward`` (``mha_dsa_warmup_attention.py:103``,
+``:179-198``) and only adds the full-candidate indexer KL. There is no
+``[b, s, s]`` index table and no block-sparse kernel call in this phase at all.
 
-1. ``hybrid_mla_attention="mqa_dsa"`` with ``dsa_indexer_use_sparse_loss=False``
-   -- the phase-2 (DSA warmup) pairing, where attention consumes the full
-   per-document causal set while the indexer is trained by a KL over that same
-   full causal set (no top-k anywhere). The existing CP suites run ``True``
-   everywhere except the one ``(masked=True, sparse=False)`` subtest of
-   ``test_mqa_dsa_cp.py::test_7``, which only observes parameter gradients. The
-   warmup mode takes its own branch (``mqa_latent_attention._forward_warmup``)
-   whose index table and causal mask are both built at ``s_global`` and
-   row-sliced, so it needs its own CP evidence: that the attention output is the
-   CP=1 reference, that the table really is the global one sliced, that the mode
-   is bit-identical to ``"mqa_full_causal"`` under CP, and that the full-causal
-   KL normalises across the CP group on both the masked and the unmasked branch
-   (``_indexer_loss_mask`` / the all-ones fallback, both of which divide by the
-   **global** row count so the per-rank losses simply add up).
+That moves, but does not remove, the CP evidence this file owes:
 
-2. A layout with genuine **row-validity pad rows**. ``_STRADDLE`` sums to
-   exactly ``S_GLOBAL`` and ``U._row_end`` folds any trailing gap into one final
-   document, so ``is_valid`` has been all-``True`` in every CP test so far; the
-   pad-row path (all-``-1`` index row -> zero output, zero ``dq``) was only ever
-   audited on one card. ``[475] @ s=512`` puts 37 pad rows on the last rank
-   only, which is also the pad-imbalance the loss denominator has to survive.
+1. Two independent CP states have to be right at once. The attention half reads
+   the *process-global* ``paddlefleet.parallel_state`` group, at construction
+   (``dot_product_attention.py:155``) and at dispatch (``:397``, ``:565-570``);
+   the indexer half reads ``pg_collection.cp``
+   (``hybrid_mla_indexer.py:88-108``). ``fleet.init`` sets only the former's
+   fleet counterpart, so the runner below toggles ``parallel_state`` explicitly
+   and the CP=1 reference is built *and* run with it off.
+2. "The full-causal ``[b, s, s]`` table is the global build, row-sliced"
+   inverts into two claims: the per-rank output is **bit-identical** to the
+   phase-1 dense attention fed the same local slice
+   (``hybrid_mla_utils._build_phase1_dense_module``), and the *indexer's*
+   candidate set -- ``csa_indexer_topk_fwd``'s ``columns``, which are global
+   token ids -- is the whole per-document causal set built over the global
+   sequence and row-sliced (``hybrid_mla_indexer._indexer_valid_range``).
+3. The full-candidate KL still has to normalise across the CP group: the masked
+   branch divides by the **global** valid-row count
+   (``hybrid_mla_indexer.py:215-220``) and the unmasked one folds ``/cp_size``
+   into the coefficient handed to the *backward*
+   (``mha_dsa_warmup_attention.py:322-326``).
+4. A layout with genuine row-validity pad rows. ``_STRADDLE`` sums to exactly
+   ``S_GLOBAL`` and ``U._row_end`` folds any trailing gap into one final
+   document, so ``is_valid`` is all-``True`` in every other CP test.
+   ``[475] @ s=512`` puts 37 pad rows on the last rank only, which is also the
+   pad imbalance the loss denominator has to survive. The phase-3 (latent,
+   block-sparse) pad-row cases stay here as well, on ``test_mqa_dsa_cp``'s
+   harness, so a pad-row failure can be attributed to a phase.
 
-Everything reuses ``test_mqa_dsa_cp``'s harness (fleet init, CP globals,
-``run_core_cp``, ``_check``, ``_check_index_sets``). No ``if rank == X``
-short-circuit exists in this file: every collective (``run_core_cp``'s
-all-reduces, the all-gather inside the layer) is issued on all ranks and only
-the assertions are rank-conditional.
+Phase 3/4's own loss normalisation is swept in
+``test_mqa_dsa_cp.py::TestMQADSACP::test_7``; this file owns phase 2.
+
+No ``if rank == X`` short-circuit exists in this file: every collective is
+issued on all ranks and only the assertions are rank-conditional.
 
 Run (2 or 4 GPUs)::
 
@@ -53,8 +68,11 @@ Run (2 or 4 GPUs)::
 test_mqa_dsa_warmup_cp.py
 """
 
+import contextlib
+import types
 import unittest
 
+import numpy as np
 import paddle
 import paddle.distributed as dist
 
@@ -63,8 +81,17 @@ import paddle.distributed as dist
 # ``test_mla_cp_recompute`` importing ``test_mla_cp_contiguous_allgather``).
 import test_mqa_dsa_cp as H
 
+from paddlefleet import parallel_state as ps
+from paddlefleet.transformer import mha_dsa_warmup_attention as warmup_mod
 from paddlefleet.transformer.csa_attention import _derive_csa_doc_boundaries
-from paddlefleet.transformer.mqa_latent_attention import MQALatentAttention
+from paddlefleet.transformer.dsa_attention import DSAIndexerLossLoggingHelper
+from paddlefleet.transformer.enums import AttnMaskType
+from paddlefleet.transformer.hybrid_mla_indexer import latent_mqa_enabled
+from paddlefleet.transformer.mha_dsa_warmup_attention import (
+    MHADSAWarmupAttention,
+)
+
+U = H.U
 
 S_GLOBAL = H.S_GLOBAL
 _STRADDLE = H._STRADDLE
@@ -77,15 +104,73 @@ _STRADDLE = H._STRADDLE
 _PAD_DOC_LEN = 475
 _N_PAD = S_GLOBAL - _PAD_DOC_LEN
 
+FWD_RTOL = H.FWD_RTOL
+GRAD_RTOL = H.GRAD_RTOL
+
+# Floor for the warmup-vs-phase-1 ``dq`` comparison, used only when the phase-1
+# module's own two runs happen to agree exactly on this batch: one bf16 ulp at
+# the scale of these gradients (2**-8 relative, |dq| ~ 1e-2 in this fixture).
+# The measured spread between two runs of the same module is 3.052e-05 at
+# s=512, so this floor is not what carries the assertion -- see
+# ``_assert_phase1_identical``.
+_DQ_ATOMIC_FLOOR = 1e-4
+
 # The logged indexer loss is a bf16-fed fp32 KL reduction, so the per-rank sum
 # lands a few 1e-4 off the single-rank value. A wrong denominator is off by
 # ``cp_size`` (100% at CP=2), so this bound is three orders of magnitude away
 # from the failure it has to catch.
 LOSS_RTOL = 5e-3
 
+# Positional arguments of ``TileLangCSAIndexerLossAutoScaler.apply`` as phase 2
+# calls it (``mha_dsa_warmup_attention.py:342-354``).
+_ARG_LOSS_COEFF = 7
+_ARG_LOSS_MASK = 10
+
 
 def setUpModule():
     H.setUpModule()
+    # The attention half is ``DotProductAttention``'s and takes its CP state
+    # from the *process-global* ``parallel_state`` group, at construction
+    # (``dot_product_attention.py:155``) and at dispatch (``:397``, ``:565``),
+    # not from ``pg_collection.cp`` the way the indexer half does
+    # (``hybrid_mla_indexer.py:88-108``). ``fleet.init`` does not set it, so
+    # keep it off by default -- the CP=1 reference must build *and* run non-CP
+    # -- and turn it on only around the CP modules.
+    ps._CONTEXT_PARALLEL_GROUP = None
+
+
+@contextlib.contextmanager
+def _cp_enabled():
+    """Make ``paddlefleet.parallel_state`` report this test's CP group."""
+    ps._CONTEXT_PARALLEL_GROUP = H.CP_GROUP
+    try:
+        yield
+    finally:
+        ps._CONTEXT_PARALLEL_GROUP = None
+
+
+@contextlib.contextmanager
+def _capture_loss_args():
+    """Record every ``TileLangCSAIndexerLossAutoScaler.apply`` argument list.
+
+    Phase 2 attaches its loss through ``mha_dsa_warmup_attention``'s own symbol
+    (``mha_dsa_warmup_attention.py:342``), so that is the one to patch;
+    ``mqa_latent_attention``'s is phase 3's.
+    """
+    real = warmup_mod.TileLangCSAIndexerLossAutoScaler
+    calls = []
+
+    class _Spy:
+        @staticmethod
+        def apply(*args, **kwargs):
+            calls.append(args)
+            return real.apply(*args, **kwargs)
+
+    warmup_mod.TileLangCSAIndexerLossAutoScaler = _Spy
+    try:
+        yield calls
+    finally:
+        warmup_mod.TileLangCSAIndexerLossAutoScaler = real
 
 
 def _pad_row_end(doc_len, s_global):
@@ -110,19 +195,225 @@ def _maxabs(a, b):
     return float((a.cast("float32") - b.cast("float32")).abs().max())
 
 
+def _bit_equal(a, b):
+    """Bit equality of two bf16 tensors, tolerating matching ``NaN``s.
+
+    A fully masked (pad) row is left to the flashmask kernel, which may return
+    ``NaN`` there; ``_maxabs`` would then read ``nan`` and compare false against
+    every bound, including ``== 0.0``. What this file asserts is that phase 2
+    and phase 1 produce *the same bits*, ``NaN`` included.
+    """
+    x = a.cast("float32").numpy()
+    y = b.cast("float32").numpy()
+    return bool(np.array_equal(x, y, equal_nan=True))
+
+
 def _local_slice():
     """``(row_offset, rows)`` of this CP rank's query rows."""
     rows = S_GLOBAL // H.CP_SIZE
     return H.CP_RANK * rows, rows
 
 
-class _CPChecks(unittest.TestCase):
-    """Shared assertions, borrowed from the harness class.
+def _warmup_cfg(cp_size, loss_coeff=0.0):
+    """Phase-2 config: ``mqa_dsa`` with the sparse-loss switch off."""
+    cfg = U._create_mqa_config(
+        mode="mqa_dsa", loss_coeff=loss_coeff, sparse_loss=False
+    )
+    cfg.cp_balance_mode = "contiguous_allgather"
+    # Production EB dataflow hands every rank the *global* ``input_ids``, which
+    # is the branch ``_indexer_loss_mask`` takes when this flag is set
+    # (``hybrid_mla_indexer.py:210-214``).
+    cfg.experimental_dataflow = True
+    cfg.pad_token_id = 0
+    cfg.context_parallel_size = cp_size
+    assert not latent_mqa_enabled(cfg), (
+        "mqa_dsa + dsa_indexer_use_sparse_loss=False must not select latent "
+        "MQA (hybrid_mla_indexer.py:59-60); this suite would silently be "
+        "testing phase 3 instead of the warmup phase"
+    )
+    return cfg
 
-    ``_check`` (forward + every gradient against the CP=1 reference) and
-    ``_check_index_sets`` (the sparse kernel is handed the reference's own
-    columns) are the same contract here, so call the harness' own
-    implementations rather than restating them.
+
+def _build_warmup(cp_group, loss_coeff=0.0, seed=7):
+    """CP=1 reference (``cp_group is None``) or CP layer, identical weights.
+
+    Must be called under :func:`_cp_enabled` for the CP layer and outside it for
+    the reference: ``pg_collection.cp`` drives the indexer half only.
+    """
+    cfg = _warmup_cfg(1 if cp_group is None else cp_group.nranks, loss_coeff)
+    paddle.seed(seed)
+    module = U._build_module(
+        cfg,
+        bf16=True,
+        pg_collection=types.SimpleNamespace(tp=None, cp=cp_group),
+    )
+    assert isinstance(module, MHADSAWarmupAttention), (
+        f"the phase-2 fixture built {type(module).__name__}, not the dense "
+        "MHADSAWarmupAttention"
+    )
+    return module
+
+
+def _capture_columns(module, store):
+    """Record ``_dense_attn_target``'s ``columns`` (global token ids).
+
+    ``RecordingWarmupMHA`` keeps the KL *target*, which is already permuted into
+    the kernel's column order, so the candidate ids themselves have to be taken
+    from the call's third positional argument
+    (``mha_dsa_warmup_attention.py:305-314``).
+    """
+    inner = module._dense_attn_target
+
+    def wrapper(*args, **kwargs):
+        store.append(args[2].numpy().copy())
+        return inner(*args, **kwargs)
+
+    module._dense_attn_target = wrapper
+
+
+def _forward(module, q, k, v, row_end, x=None, qr=None, ids=None):
+    """One dense forward, per-document causal, ``row_end`` at global length.
+
+    ``attn_mask_type`` has to be passed explicitly: on a ``None`` argument
+    ``DotProductAttention`` derives ``is_causal = attn_mask_type ==
+    AttnMaskType.causal`` (``dot_product_attention.py:562``), i.e. non-causal.
+    The mask is global on both sides because
+    ``expand_attn_mask_startend_row_indices_for_cp`` builds its second column
+    from ``arange(s_local * cp_size)`` and expands it onto the mask's own rows
+    (``:319-342``), so a local-length table would not even broadcast; the CP
+    kernel then slices it per rank (``context_parallel_utils.py:1979-1992``).
+
+    ``x`` left ``None`` selects the phase-1 module's narrower signature (it
+    takes no ``input_ids`` -- ``accepts_input_ids`` is the phase-2 mixin's,
+    ``hybrid_mla_indexer.py:76``).
+    """
+    extra = {} if x is None else {"x": x, "qr": qr, "input_ids": ids}
+    return module(
+        q,
+        k,
+        v,
+        None,
+        attn_mask_startend_row_indices=row_end.clone(),
+        attn_mask_type=AttnMaskType.causal,
+        **extra,
+    )
+
+
+def run_warmup_cp(
+    doc_lens,
+    loss_coeff=0.0,
+    with_input_ids=False,
+    row_end=None,
+    s_global=S_GLOBAL,
+):
+    """CP=1 reference, the CP layer, and the phase-1 dense module on one batch.
+
+    Three modules rather than the harness' two: the phase-2 attention half is
+    ``DotProductAttention.forward`` verbatim
+    (``mha_dsa_warmup_attention.py:179-198``), so the phase-1 module fed this
+    rank's slice is the reference for *bit* equality, while the CP=1 phase-2
+    module is the reference for CP equivalence.
+    """
+    sl = s_global // H.CP_SIZE
+    off = H.CP_RANK * sl
+    if row_end is None:
+        row_end = U._row_end(doc_lens, s_global)
+    q, k, v, x, qr = U._make_dense_inputs(s_global, seed=3)
+    ids = H._input_ids(s_global) if with_input_ids else None
+
+    ref = _build_warmup(None, loss_coeff)
+    with _cp_enabled():
+        cpl = _build_warmup(H.CP_GROUP, loss_coeff)
+        phase1 = U._build_phase1_dense_module(_warmup_cfg(H.CP_SIZE), bf16=True)
+    cpl.set_state_dict(ref.state_dict())
+
+    U._CAPTURED.clear()
+    U._WARMUP_TARGETS.clear()
+    DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+    cols_ref = []
+    _capture_columns(ref, cols_ref)
+    ra = [H._leaf(t) for t in (q, k, v, x, qr)]
+    out_ref = _forward(ref, ra[0], ra[1], ra[2], row_end, ra[3], ra[4], ids)
+    out_ref.sum().backward()
+    logged_ref = H._logged_indexer_loss()
+    targets_ref = list(U._WARMUP_TARGETS)
+
+    U._CAPTURED.clear()
+    U._WARMUP_TARGETS.clear()
+    DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+    cols_cp = []
+    _capture_columns(cpl, cols_cp)
+    cb = [H._leaf(t[:, off : off + sl]) for t in (q, k, v, x, qr)]
+    p1 = [H._leaf(t[:, off : off + sl]) for t in (q, k, v)]
+    # Second phase-1 run on fresh leaves, same module, same inputs: the
+    # kernel's own run-to-run spread, used as the bound for the warmup-vs-phase-1
+    # ``dq`` comparison. Measured: the forward, ``dk`` and ``dv`` are bitwise
+    # reproducible, ``dq`` is not (3.052e-05 at s=512 between two runs of the
+    # *same* module), because the flashmask backward accumulates ``dq`` across
+    # column blocks with atomics.
+    p1c = [H._leaf(t[:, off : off + sl]) for t in (q, k, v)]
+    with _cp_enabled(), _capture_loss_args() as loss_args:
+        out = _forward(cpl, cb[0], cb[1], cb[2], row_end, cb[3], cb[4], ids)
+        out.sum().backward()
+        out_p1 = _forward(phase1, p1[0], p1[1], p1[2], row_end)
+        out_p1.sum().backward()
+        out_p1c = _forward(phase1, p1c[0], p1c[1], p1c[2], row_end)
+        out_p1c.sum().backward()
+    logged_cp = H._logged_indexer_loss()
+
+    # Parameter grads: this rank only saw its own query rows, so the CP group's
+    # SUM is the reference. The attention half owns no parameter in this fixture
+    # (no sink is configured, so ``build_softmax_offset`` returns ``None``),
+    # which is also why the phase-1 module needs no ``set_state_dict``.
+    ref_named = dict(ref.named_parameters())
+    param_err = {}
+    for name, p in cpl.named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.contiguous()
+        dist.all_reduce(g, group=H.CP_GROUP)
+        rg = ref_named[name].grad
+        param_err[name] = None if rg is None else H._rel(g, rg)
+
+    return {
+        "fwd": H._rel(out, out_ref[:, off : off + sl]),
+        "dq": H._rel(cb[0].grad, ra[0].grad[:, off : off + sl]),
+        "dk": H._rel(cb[1].grad, ra[1].grad[:, off : off + sl]),
+        "dv": H._rel(cb[2].grad, ra[2].grad[:, off : off + sl]),
+        "param_err": param_err,
+        "out": out.detach(),
+        "ref_out": out_ref.detach(),
+        "dq_local": cb[0].grad.detach(),
+        # The phase-1 dense module on this rank's slice: the reference for the
+        # output (bitwise) and for ``dq`` (within the control spread below).
+        "phase1_out": out_p1.detach(),
+        "phase1_dq": p1[0].grad.detach(),
+        "phase1_out_control": out_p1c.detach(),
+        "phase1_dq_control": p1c[0].grad.detach(),
+        # ``columns`` are global token ids on both sides, so the reference's
+        # rows compare to this rank's directly, with no offset arithmetic.
+        "cols_ref_slice": cols_ref[-1][:, off : off + sl] if cols_ref else None,
+        "cols_cp": cols_cp[-1] if cols_cp else None,
+        "targets_ref": targets_ref,
+        "targets_cp": list(U._WARMUP_TARGETS),
+        # ``RecordingMQA``'s hook: any entry means a block-sparse kernel call
+        # happened, which phase 2 must never make.
+        "captured": len(U._CAPTURED),
+        "loss_args": list(loss_args),
+        "logged_ref": logged_ref,
+        "logged_cp": logged_cp,
+        "row_end": row_end,
+        "off": off,
+        "rows": sl,
+    }
+
+
+class _CPChecks(unittest.TestCase):
+    """Shared assertions.
+
+    ``_check`` / ``_check_index_sets`` are the harness' own implementations,
+    used by the latent (phase 3/4) pad-row cases; everything below them is the
+    dense phase-2 contract.
     """
 
     def _check(self, res, tag):
@@ -131,212 +422,117 @@ class _CPChecks(unittest.TestCase):
     def _check_index_sets(self, res, tag):
         H.TestMQADSACP._check_index_sets(self, res, tag)
 
-    def _assert_full_causal(self, idx, row_end, tag):
-        """Every local row's selected set == its whole per-document causal set.
+    def _check_dense(self, res, tag):
+        """CP=N == CP=1 on this rank's slice: output and every gradient."""
+        for key, bound in (
+            ("fwd", FWD_RTOL),
+            ("dq", GRAD_RTOL),
+            ("dk", GRAD_RTOL),
+            ("dv", GRAD_RTOL),
+        ):
+            self.assertLess(res[key], bound, f"{tag}: {key} {res[key]:.3e}")
+        for name, err in res["param_err"].items():
+            self.assertIsNotNone(
+                err, f"{tag}: reference has no grad for {name}"
+            )
+            self.assertLess(err, GRAD_RTOL, f"{tag}: param {name} {err:.3e}")
+        worst = max(res["param_err"].values(), default=0.0)
+        print(
+            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: "
+            f"fwd={res['fwd']:.2e} dq={res['dq']:.2e} dk={res['dk']:.2e} "
+            f"dv={res['dv']:.2e} param_max={worst:.2e}",
+            flush=True,
+        )
 
-        This is what separates the warmup mode from phase 3: under
-        ``window + top-k`` a row longer than ``window + index_topk`` selects a
-        strict subset, so this assertion would fail there.
+    def _assert_no_block_sparse(self, res, tag):
+        """No ``[b, s, s]`` table, no block-sparse call -- the inverted claim.
+
+        The old suite asserted phase 2 built the *same* full-causal index table
+        as ``mqa_full_causal``. Phase 2 no longer builds one at all, so the
+        evidence is that ``RecordingMQA``'s ``_sparse_attn`` hook never fired.
+        """
+        self.assertEqual(
+            res["captured"],
+            0,
+            f"{tag}: {res['captured']} block-sparse kernel call(s) were made "
+            "in the warmup phase, which must run dense flashmask only",
+        )
+
+    def _assert_phase1_identical(self, res, tag):
+        """Per-rank output == the phase-1 dense module's bitwise; ``dq`` == it to
+        within the kernel's own run-to-run spread.
+
+        This is the other half of the inversion: "phase 2 is phase 1 plus an
+        indexer loss" is only true if the attention half is untouched, and the
+        indexer loss reaches the output solely through
+        ``TileLangCSAIndexerLossAutoScaler``'s *backward*
+        (``mha_dsa_warmup_attention.py:342-354``), so even a live loss must not
+        move the forward. Asserted with the CP row-slicing in the path.
+
+        ``dq`` cannot be asserted bitwise, and the bound is measured rather than
+        chosen: two backward passes of the *same* phase-1 module on the same
+        inputs already disagree (3.052e-05 at s=512), because the flashmask
+        backward accumulates ``dq`` over column blocks with atomics. The
+        forward, ``dk`` and ``dv`` are bitwise reproducible, so those stay exact.
+        The control is computed in this same run
+        (``run_warmup_cp``: ``phase1_dq_control``), so a real divergence -- which
+        would be orders of magnitude larger, as the un-sliced-mask and
+        wrong-offset controls in this suite show -- still fails.
+        """
+        same = _bit_equal(res["out"], res["phase1_out"])
+        delta = _maxabs(res["out"], res["phase1_out"])
+        print(
+            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: output vs "
+            f"phase-1 dense maxabs={delta:.3e} bit_equal={same}",
+            flush=True,
+        )
+        self.assertTrue(
+            same,
+            f"{tag}: the warmup output is not bit-identical to the phase-1 "
+            f"dense module's (maxabs={delta:.3e}), so phase 2 is no longer "
+            "'phase 1 plus an indexer loss'",
+        )
+        dq_delta = _maxabs(res["dq_local"], res["phase1_dq"])
+        control = _maxabs(res["phase1_dq"], res["phase1_dq_control"])
+        print(
+            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: dq vs phase-1 "
+            f"dense maxabs={dq_delta:.3e} (phase-1 self-control "
+            f"{control:.3e})",
+            flush=True,
+        )
+        self.assertLessEqual(
+            dq_delta,
+            max(control, _DQ_ATOMIC_FLOOR),
+            f"{tag}: the warmup dq differs from the phase-1 dense module's by "
+            f"{dq_delta:.3e}, more than that module's own run-to-run spread "
+            f"({control:.3e}), so phase 2's attention backward is not phase "
+            "1's",
+        )
+
+    def _assert_full_causal_columns(self, res, tag):
+        """Every local row's candidate set == its whole per-document causal set.
+
+        ``csa_indexer_topk_fwd`` runs in full-candidate mode here (``ratio=1``,
+        ``topk_effective=s_global``), fed a ``valid_range`` built over the
+        global sequence and row-sliced with ``window=0``
+        (``mha_dsa_warmup_attention.py:283-300``,
+        ``hybrid_mla_indexer.py:151-191``). Under phase 3's window + top-k a row
+        longer than ``window + index_topk`` would select a strict subset, so
+        this assertion separates the two phases without needing phase 3's
+        columns for comparison.
         """
         off, rows = _local_slice()
-        doc_start, is_valid = _doc_bounds(row_end, S_GLOBAL)
+        doc_start, is_valid = _doc_bounds(res["row_end"], S_GLOBAL)
+        cols = res["cols_cp"]
+        self.assertIsNotNone(cols, f"{tag}: the indexer produced no columns")
+        self.assertEqual(int(cols.shape[1]), rows, f"{tag}: row count")
         for r in range(rows):
             q = off + r
-            got = {int(c) for c in idx[0][r] if c >= 0}
+            got = {int(c) for c in cols[0][r] if c >= 0}
             want = set(range(doc_start[q], q + 1)) if is_valid[q] else set()
             self.assertEqual(
                 got, want, f"{tag}: row {r} (global {q}) is not full-causal"
             )
-
-
-class TestWarmupCP(_CPChecks):
-    """``mqa_dsa`` + ``dsa_indexer_use_sparse_loss=False`` under CP."""
-
-    @H.U._GPU
-    def test_1_warmup_forward_equivalence(self):
-        """CP=N == CP=1 on the warmup path, with and without a live loss.
-
-        ``dsa_indexer_loss_coeff == 0`` returns straight after the full-causal
-        attention and never touches the indexer projections;
-        ``> 0`` additionally runs the full-candidate indexer KL
-        (``csa_indexer_topk_fwd`` with ``topk_effective=s_global``) over the
-        whole causal set. Neither may perturb the attention output, so both are
-        checked against the same reference.
-        """
-        for coeff in (0.0, 0.1):
-            with self.subTest(loss_coeff=coeff):
-                tag = f"warmup/coeff={coeff}"
-                res = H.run_core_cp(
-                    "mqa_dsa",
-                    _STRADDLE,
-                    loss_coeff=coeff,
-                    with_input_ids=coeff > 0,
-                    sparse_loss=False,
-                )
-                self._check(res, tag)
-                self._check_index_sets(res, tag)
-                self._assert_full_causal(res["idx_cp"], res["row_end"], tag)
-
-    @H.U._GPU
-    def test_2_warmup_token_indices_are_the_global_table_row_sliced(self):
-        """The kernel's table == the global build, sliced -- bitwise.
-
-        A per-rank build (``s_local`` rows, ``doc_start`` sliced first) clips
-        each row at ``q - position_offset`` and drops the prefix owned by lower
-        ranks. The control at the end constructs exactly that and asserts it
-        differs, so this comparison cannot be vacuous on rank > 0.
-        """
-        off, rows = _local_slice()
-        res = H.run_core_cp("mqa_dsa", _STRADDLE, sparse_loss=False)
-        row_end = res["row_end"]
-        doc_start, _, is_valid, _, _ = _derive_csa_doc_boundaries(
-            row_end, S_GLOBAL
-        )
-        want = MQALatentAttention._build_full_causal_indices(
-            1, S_GLOBAL, doc_start, is_valid
-        )[:, off : off + rows]
-        got = paddle.to_tensor(res["idx_cp"])
-        self.assertEqual(list(got.shape), list(want.shape), "table shape")
-        drift = int((got.cast("int64") != want.cast("int64")).sum())
-        self.assertEqual(
-            drift,
-            0,
-            f"{drift} of {int(got.numel())} slots differ from the global table",
-        )
-
-        # Control: the same builder driven at the local length, with the
-        # document starts rebased (and clipped) into local coordinates -- the
-        # shape a CP-unaware implementation would produce.
-        local = MQALatentAttention._build_full_causal_indices(
-            1,
-            rows,
-            paddle.clip(doc_start[off : off + rows] - off, min=0),
-            is_valid[off : off + rows],
-        )
-        print(
-            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] token_indices drift vs "
-            f"global table = {drift}",
-            flush=True,
-        )
-        if H.CP_RANK == 0:
-            return
-        self.assertGreater(
-            int((local.cast("int64") != want[:, :, :rows].cast("int64")).sum()),
-            0,
-            "a per-rank index build was indistinguishable from the global "
-            "one, so this test is vacuous",
-        )
-
-    @H.U._GPU
-    def test_3_warmup_equals_mqa_full_causal_under_cp(self):
-        """Warmup output == ``hybrid_mla_attention="mqa_full_causal"`` output.
-
-        Both modes call ``_build_full_causal_indices`` and then the same sparse
-        kernel with the same inputs -- ``_forward_warmup`` reaches it *through*
-        ``_forward_full_causal`` -- so on each rank this must be *bitwise* equal,
-        not merely close. The single-card claim (maxabs 0.0) is asserted here
-        with the CP row-slicing in the path, and it is also what pins the
-        phase-2 attention set to the frozen backbone's phase-1 one.
-        """
-        ref = H.run_core_cp("mqa", _STRADDLE)
-        for coeff in (0.0, 0.1):
-            with self.subTest(loss_coeff=coeff):
-                warm = H.run_core_cp(
-                    "mqa_dsa",
-                    _STRADDLE,
-                    loss_coeff=coeff,
-                    with_input_ids=coeff > 0,
-                    sparse_loss=False,
-                )
-                delta = _maxabs(warm["out"], ref["out"])
-                print(
-                    f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] warmup vs "
-                    f"mqa_full_causal (coeff={coeff}): maxabs={delta:.3e}",
-                    flush=True,
-                )
-                self.assertEqual(
-                    delta,
-                    0.0,
-                    f"warmup output is not bit-identical to mqa_full_causal "
-                    f"(coeff={coeff}, maxabs={delta:.3e})",
-                )
-
-    @H.U._GPU
-    def test_4_indexer_loss_cp_normalisation(self):
-        """The logged indexer loss must sum to the CP=1 value across the group.
-
-        Read straight out of ``DSAIndexerLossLoggingHelper``, so it observes the
-        denominator itself rather than its shadow in the gradients. Phase 2
-        (``sparse_loss=False``) has one formula on both branches: the row mask is
-        always a real tensor -- ``_indexer_loss_mask``'s global-count mask when
-        ``input_ids`` reached the layer, an all-ones mask over ``b * s_global``
-        when it did not -- so every rank contributes its own rows to one global
-        mean and the per-rank losses are partial sums. Phase 3
-        (``sparse_loss=True``) still keeps the two-branch form (global count when
-        masked, a local mean times ``1 / cp_size`` when not); both must land on
-        the CP=1 value. ``sparse_loss`` is swept so a failure can be attributed:
-        warmup-only means the full-causal KL broke it, both means the
-        pre-existing normalisation is wrong.
-
-        Note this layout does not exercise the *width* difference between the two
-        ``sparse_loss`` values as sharply as it could: with documents of
-        200/150/162 and a 128-wide forced window, most rows have few non-local
-        candidates. ``test_5`` covers the width itself.
-        """
-        for sparse in (False, True):
-            for masked in (True, False):
-                with self.subTest(sparse_loss=sparse, masked=masked):
-                    tag = f"loss/sparse={sparse}/masked={masked}"
-                    res = H.run_core_cp(
-                        "mqa_dsa",
-                        _STRADDLE,
-                        loss_coeff=0.1,
-                        with_input_ids=masked,
-                        sparse_loss=sparse,
-                    )
-                    self.assertTrue(
-                        any(n.startswith("indexer.") for n in res["param_err"]),
-                        f"{tag}: the indexer received no gradient",
-                    )
-                    self._check(res, tag)
-                    self._assert_loss_cp_sum(res, tag)
-
-    @H.U._GPU
-    def test_5_widened_warmup_loss_table_under_cp(self):
-        """One 512-long document, so the two phases' KL supports differ widely.
-
-        Phase 2's KL spans the whole per-document causal set (up to 512 columns
-        on this layout) while phase 3's spans window(128) + top-k(128), so the
-        two logged losses must differ -- that is the non-vacuity control for
-        ``test_4`` -- while each still normalises across the CP group.
-        """
-        logged = {}
-        for sparse in (False, True):
-            with self.subTest(sparse_loss=sparse):
-                tag = f"wide/sparse={sparse}"
-                res = H.run_core_cp(
-                    "mqa_dsa",
-                    [S_GLOBAL],
-                    loss_coeff=0.1,
-                    with_input_ids=True,
-                    sparse_loss=sparse,
-                )
-                self._check(res, tag)
-                logged[sparse] = self._assert_loss_cp_sum(res, tag)
-        spread = abs(logged[False] - logged[True]) / abs(logged[True])
-        print(
-            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] wide vs narrow KL: "
-            f"{logged[False]:.6e} vs {logged[True]:.6e} rel={spread:.3e}",
-            flush=True,
-        )
-        self.assertGreater(
-            spread,
-            1e-3,
-            "the widened warmup KL table produced the same loss as the narrow "
-            f"one ({logged[False]:.6e} vs {logged[True]:.6e}), so "
-            "dsa_indexer_use_sparse_loss is not changing the table here and "
-            "test_4 is width-blind",
-        )
 
     def _assert_loss_cp_sum(self, res, tag):
         """Sum the per-rank logged loss and compare to the CP=1 value."""
@@ -360,35 +556,271 @@ class TestWarmupCP(_CPChecks):
         )
         return want
 
+    def _assert_loss_coeff(self, res, masked, loss_coeff, tag):
+        """The unmasked ``/cp_size`` must reach the *backward*, not just the log.
+
+        ``csa_attention`` folds it into the logged scalar only; phase 2 puts it
+        in the coefficient it hands the autoscaler
+        (``mha_dsa_warmup_attention.py:322-326``), which is the value the
+        tilelang backward multiplies ``(P - Q)`` by. The logged loss cannot see
+        the difference -- both placements produce the same scalar -- so read the
+        argument itself.
+        """
+        self.assertEqual(len(res["loss_args"]), 1, f"{tag}: one loss per layer")
+        args = res["loss_args"][0]
+        got = float(args[_ARG_LOSS_COEFF])
+        want = loss_coeff if masked else loss_coeff / H.CP_SIZE
+        self.assertAlmostEqual(
+            got,
+            want,
+            places=9,
+            msg=f"{tag}: the backward got loss_coeff={got:.6e}, expected "
+            f"{want:.6e} (masked={masked}, cp_size={H.CP_SIZE})",
+        )
+        mask = args[_ARG_LOSS_MASK]
+        if masked:
+            self.assertIsNotNone(mask, f"{tag}: input_ids built no row mask")
+            self.assertEqual(
+                list(mask.shape), [1, res["rows"]], f"{tag}: mask is not local"
+            )
+        else:
+            self.assertIsNone(mask, f"{tag}: a mask appeared without input_ids")
+
+    def _assert_columns_match_reference(self, res, tag):
+        """The CP layer's candidate set == the CP=1 layer's, for these rows.
+
+        Set equality per row rather than sequence equality: the kernel's slot
+        order is its own business, and ``columns`` is what the KL target is
+        permuted into (``mha_dsa_warmup_attention.py:454-459``).
+        """
+        want, got = res["cols_ref_slice"], res["cols_cp"]
+        self.assertIsNotNone(got, f"{tag}: the CP layer produced no columns")
+        self.assertIsNotNone(want, f"{tag}: the reference produced no columns")
+        self.assertEqual(list(got.shape), list(want.shape), f"{tag}: shape")
+        for r in range(int(got.shape[1])):
+            a = {int(c) for c in want[0][r] if c >= 0}
+            b = {int(c) for c in got[0][r] if c >= 0}
+            self.assertEqual(
+                b,
+                a,
+                f"{tag}: row {r} (global {res['off'] + r}) differs: "
+                f"missing={sorted(a - b)[:8]} extra={sorted(b - a)[:8]}",
+            )
+
+    def _rel_on_valid_rows(self, res):
+        """Relative error against the CP=1 reference, valid rows only.
+
+        A fully masked pad row is the flashmask kernel's business and may come
+        back as ``NaN``, which would poison a whole-slice norm. Bit equality to
+        the phase-1 module (``_assert_phase1_identical``) is what covers those
+        rows here.
+        """
+        off, rows = _local_slice()
+        _, is_valid = _doc_bounds(res["row_end"], S_GLOBAL)
+        keep = [r for r in range(rows) if is_valid[off + r]]
+        got = res["out"].cast("float32").numpy()[0][keep]
+        want = res["ref_out"].cast("float32").numpy()[0][off : off + rows][keep]
+        denom = max(float(np.linalg.norm(want)), 1e-12)
+        return float(np.linalg.norm(got - want)) / denom
+
+
+class TestWarmupCP(_CPChecks):
+    """``mqa_dsa`` + ``dsa_indexer_use_sparse_loss=False`` under CP."""
+
+    @H.U._GPU
+    def test_1_warmup_forward_equivalence(self):
+        """CP=N == CP=1 on the warmup path, with and without a live loss.
+
+        ``dsa_indexer_loss_coeff == 0`` returns straight after the dense
+        attention and never touches the indexer projections
+        (``mha_dsa_warmup_attention.py:199-200``); ``> 0`` additionally runs the
+        full-candidate indexer KL. Neither may perturb the attention output, so
+        both are checked against the same reference *and* against the phase-1
+        dense module.
+        """
+        for coeff in (0.0, 0.1):
+            with self.subTest(loss_coeff=coeff):
+                tag = f"warmup/coeff={coeff}"
+                res = run_warmup_cp(
+                    _STRADDLE, loss_coeff=coeff, with_input_ids=coeff > 0
+                )
+                self._check_dense(res, tag)
+                self._assert_no_block_sparse(res, tag)
+                self._assert_phase1_identical(res, tag)
+                if coeff > 0:
+                    self._assert_full_causal_columns(res, tag)
+
+    @H.U._GPU
+    def test_2_candidate_columns_are_the_global_set_row_sliced(self):
+        """The indexer's candidates == the global build, sliced.
+
+        ``columns`` are global token ids, so this rank's rows must equal the
+        CP=1 reference's same rows with no rebasing. The control at the end
+        constructs the set a CP-unaware build would produce -- ``valid_range``
+        derived from *local* coordinates, i.e. rows clipped at
+        ``q - position_offset`` with the prefix owned by lower ranks dropped --
+        and asserts it differs, so the comparison cannot be vacuous on rank > 0.
+        """
+        tag = "columns"
+        res = run_warmup_cp(_STRADDLE, loss_coeff=0.1, with_input_ids=True)
+        self._assert_columns_match_reference(res, tag)
+        self._assert_full_causal_columns(res, tag)
+
+        off, rows = _local_slice()
+        doc_start, is_valid = _doc_bounds(res["row_end"], S_GLOBAL)
+        widths = [
+            len({int(c) for c in res["cols_cp"][0][r] if c >= 0})
+            for r in range(rows)
+        ]
+        print(
+            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] candidate widths: "
+            f"min={min(widths)} max={max(widths)}",
+            flush=True,
+        )
+        if H.CP_RANK == 0:
+            return
+        local = [
+            len(range(max(doc_start[off + r] - off, 0), r + 1))
+            if is_valid[off + r]
+            else 0
+            for r in range(rows)
+        ]
+        self.assertNotEqual(
+            widths,
+            local,
+            "a local-coordinate candidate build was indistinguishable from "
+            "the global one, so this test is vacuous",
+        )
+
+    @H.U._GPU
+    def test_3_warmup_output_is_real_per_document_causal_attention(self):
+        """The non-vacuity control for the phase-1 bit-identity claim.
+
+        ``_assert_phase1_identical`` compares two runs of the same code path, so
+        on its own it would also pass if both returned garbage (or zeros). Pin
+        this rank's rows to an independent fp32 per-document causal MHA
+        (``hybrid_mla_utils._dense_mha_reference``) over the *global* batch, at
+        the module's own scale: ``softmax_scale = 1/sqrt(k_channels)``
+        (``dot_product_attention.py:210-215``, with ``k_channels=K_CHANNELS``
+        from ``_build_phase1_dense_module``), which is what
+        ``_dense_attn_target`` uses for the KL target too
+        (``mha_dsa_warmup_attention.py:440``).
+        """
+        off, rows = _local_slice()
+        res = run_warmup_cp(_STRADDLE, loss_coeff=0.1, with_input_ids=True)
+        q, k, v, _, _ = U._make_dense_inputs(S_GLOBAL, seed=3)
+        want = U._dense_mha_reference(
+            q, k, v, res["row_end"], U.K_CHANNELS**-0.5
+        )
+        err = H._rel(res["out"], want[:, off : off + rows])
+        print(
+            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] vs fp32 dense MHA: "
+            f"rel={err:.3e}",
+            flush=True,
+        )
+        self.assertLess(
+            err,
+            FWD_RTOL,
+            f"the warmup output is not per-document causal MHA (rel {err:.3e})",
+        )
+
+    @H.U._GPU
+    def test_4_indexer_loss_cp_normalisation(self):
+        """The logged loss must sum to the CP=1 value, on both mask branches.
+
+        Read straight out of ``DSAIndexerLossLoggingHelper``, so it observes the
+        denominator rather than its shadow in the gradients. Masked divides by
+        the **global** valid-row count (``hybrid_mla_indexer.py:215-220``);
+        unmasked takes the plain local mean with ``/cp_size`` folded into the
+        coefficient, which ``_assert_loss_coeff`` checks reaches the backward.
+        """
+        for masked in (True, False):
+            with self.subTest(masked=masked):
+                tag = f"loss/masked={masked}"
+                res = run_warmup_cp(
+                    _STRADDLE, loss_coeff=0.1, with_input_ids=masked
+                )
+                self.assertTrue(
+                    any(n.startswith("indexer.") for n in res["param_err"]),
+                    f"{tag}: the indexer received no gradient",
+                )
+                self._check_dense(res, tag)
+                self._assert_no_block_sparse(res, tag)
+                self._assert_loss_cp_sum(res, tag)
+                self._assert_loss_coeff(res, masked, 0.1, tag)
+
+    @H.U._GPU
+    def test_5_full_candidate_kl_is_wider_than_a_windowed_one(self):
+        """One 512-long document: the KL support is the whole causal row.
+
+        The width itself is the phase difference, so assert it directly instead
+        of comparing against a phase-3 run: the widest local candidate row must
+        exceed ``window + index_topk``, which is all phase 3 can ever supervise,
+        and the target the KL is taken over must be ``s_global`` wide
+        (``mha_dsa_warmup_attention.py:391-417``). Taken as a MAX over the CP
+        group: on rank 0 at CP=2 the widest row is exactly ``s_local``, so a
+        per-rank assertion would be a false failure there.
+        """
+        tag = "wide"
+        res = run_warmup_cp([S_GLOBAL], loss_coeff=0.1, with_input_ids=True)
+        self._check_dense(res, tag)
+        self._assert_loss_cp_sum(res, tag)
+        self._assert_full_causal_columns(res, tag)
+        self.assertEqual(
+            list(res["targets_cp"][-1].shape),
+            [1, res["rows"], S_GLOBAL],
+            f"{tag}: the KL target is not the full candidate width",
+        )
+        widest = max(
+            len({int(c) for c in res["cols_cp"][0][r] if c >= 0})
+            for r in range(res["rows"])
+        )
+        group_max = paddle.to_tensor([widest], dtype="int64")
+        dist.all_reduce(group_max, group=H.CP_GROUP, op=dist.ReduceOp.MAX)
+        narrow = U.WINDOW + U.INDEX_TOPK
+        print(
+            f"[warmup-cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: widest local "
+            f"row={widest} group_max={int(group_max[0])} narrow={narrow}",
+            flush=True,
+        )
+        self.assertGreater(
+            int(group_max[0]),
+            narrow,
+            f"{tag}: the widest candidate row across the CP group is "
+            f"{int(group_max[0])} <= window+index_topk ({narrow}), so this "
+            "layout cannot tell the full-candidate KL from a windowed one",
+        )
+
 
 class TestPadRowsCP(_CPChecks):
     """``[475] @ s=512``: 37 real pad rows, all on the last CP rank.
 
-    Every CP suite so far used layouts whose documents tile the sequence, so
-    ``is_valid`` was all-``True`` and the pad-row path -- an all-``-1`` index
-    row, which the kernel must turn into a zero output row with a zero ``dq``
-    -- was never reached under CP. The rows also sit entirely on the last rank,
-    which is the pad imbalance a per-rank loss denominator cannot survive.
+    Every other CP suite uses layouts whose documents tile the sequence, so
+    ``is_valid`` is all-``True`` and the pad-row path is never reached under CP.
+    The rows also sit entirely on the last rank, which is the pad imbalance a
+    per-rank loss denominator cannot survive. Both phases are covered so a
+    pad-row failure can be attributed to one: the latent (phase 3/4) cases run
+    on the harness' own runner, the dense warmup case on this file's.
     """
 
-    def _run(self, mode, sparse_loss):
-        row_end = _pad_row_end(_PAD_DOC_LEN, S_GLOBAL)
+    def _run_latent(self, mode, sparse_loss):
         return H.run_core_cp(
             mode,
             None,
             loss_coeff=0.1,
             with_input_ids=True,
             sparse_loss=sparse_loss,
-            row_end=row_end,
+            row_end=_pad_row_end(_PAD_DOC_LEN, S_GLOBAL),
         )
 
-    def _check_pad(self, res, tag):
-        off, rows = _local_slice()
-        _, is_valid = _doc_bounds(res["row_end"], S_GLOBAL)
-        local_pad = [r for r in range(rows) if not is_valid[off + r]]
+    def _local_pad_rows(self, row_end, tag):
+        """This rank's pad rows, after asserting the group really has ``_N_PAD``.
 
-        # The layout must actually produce pad rows *somewhere*: assert it on
-        # the group, not on this rank, since only the last rank owns them.
+        Only the last rank owns them, so the count is checked on the group.
+        """
+        off, rows = _local_slice()
+        _, is_valid = _doc_bounds(row_end, S_GLOBAL)
+        local_pad = [r for r in range(rows) if not is_valid[off + r]]
         n_pad = paddle.to_tensor([len(local_pad)], dtype="int64")
         dist.all_reduce(n_pad, group=H.CP_GROUP)
         self.assertEqual(
@@ -397,7 +829,11 @@ class TestPadRowsCP(_CPChecks):
             f"{tag}: the layout produced {int(n_pad[0])} pad rows, expected "
             f"{_N_PAD} -- the fixture no longer tests what it claims",
         )
+        return off, local_pad
 
+    def _check_pad_latent(self, res, tag):
+        """Phase 3/4: an all-``-1`` index row must give a zero output and dq."""
+        off, local_pad = self._local_pad_rows(res["row_end"], tag)
         out = res["out"].cast("float32")
         dq = res["dq_local"].cast("float32")
         for r in local_pad:
@@ -419,37 +855,73 @@ class TestPadRowsCP(_CPChecks):
             )
         print(
             f"[padrows-cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: "
-            f"local_pad_rows={len(local_pad)} fwd={res['fwd']:.2e} "
-            f"per_pos_max={max(res['per_pos']):.3e}",
+            f"local_pad_rows={len(local_pad)} fwd={res['fwd']:.2e}",
             flush=True,
         )
 
     @H.U._GPU
     def test_1_pad_rows_mqa_full_causal(self):
-        res = self._run("mqa", True)
+        res = self._run_latent("mqa", True)
         self._check(res, "pad/mqa_full_causal")
         self._check_index_sets(res, "pad/mqa_full_causal")
-        self._check_pad(res, "pad/mqa_full_causal")
+        self._check_pad_latent(res, "pad/mqa_full_causal")
 
     @H.U._GPU
-    def test_2_pad_rows_warmup(self):
-        res = self._run("mqa_dsa", False)
-        self._check(res, "pad/warmup")
-        self._check_index_sets(res, "pad/warmup")
-        self._assert_full_causal(res["idx_cp"], res["row_end"], "pad/warmup")
-        self._check_pad(res, "pad/warmup")
+    def test_2_pad_rows_warmup_dense(self):
+        """Phase 2's pad rows: whatever phase 1 does, plus an empty KL row.
+
+        The output of a fully masked row is the dense flashmask kernel's own
+        behaviour, not this phase's, so it is pinned by bit equality to the
+        phase-1 module rather than by a value; the ``NaN``-tolerant comparison
+        exists for exactly that reason. What phase 2 *does* own is the indexer
+        half: a pad row must carry no candidate and no KL mass
+        (``mha_dsa_warmup_attention.py:301-304``, ``:450``), and the loss
+        denominator must still be the global valid-row count with 37 of the pad
+        rows on one rank.
+        """
+        tag = "pad/warmup"
+        row_end = _pad_row_end(_PAD_DOC_LEN, S_GLOBAL)
+        res = run_warmup_cp(
+            None, loss_coeff=0.1, with_input_ids=True, row_end=row_end
+        )
+        off, local_pad = self._local_pad_rows(row_end, tag)
+        self._assert_no_block_sparse(res, tag)
+        self._assert_phase1_identical(res, tag)
+        self._assert_full_causal_columns(res, tag)
+
+        target = res["targets_cp"][-1]
+        for r in local_pad:
+            self.assertEqual(
+                int((res["cols_cp"][0][r] >= 0).sum()),
+                0,
+                f"{tag}: pad row {r} (global {off + r}) has candidates",
+            )
+            self.assertEqual(
+                float(np.abs(target[0][r]).max()),
+                0.0,
+                f"{tag}: pad row {r} (global {off + r}) carries KL mass",
+            )
+
+        err = self._rel_on_valid_rows(res)
+        self.assertLess(err, FWD_RTOL, f"{tag}: valid-row forward {err:.3e}")
+        for name, perr in res["param_err"].items():
+            self.assertIsNotNone(perr, f"{tag}: no reference grad for {name}")
+            self.assertLess(perr, GRAD_RTOL, f"{tag}: param {name} {perr:.3e}")
+        self._assert_loss_cp_sum(res, tag)
+        self._assert_loss_coeff(res, True, 0.1, tag)
+        print(
+            f"[padrows-cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: "
+            f"local_pad_rows={len(local_pad)} valid_row_fwd={err:.2e}",
+            flush=True,
+        )
 
     @H.U._GPU
     def test_3_pad_rows_sparse(self):
-        """Same layout on the phase-3 (``window + top-k``) path.
-
-        Included so a pad-row failure can be attributed: if it reproduces here
-        it is not specific to the warmup branch this change introduced.
-        """
-        res = self._run("mqa_dsa", True)
+        """Same layout on the phase-3 (``window + top-k``) path."""
+        res = self._run_latent("mqa_dsa", True)
         self._check(res, "pad/sparse")
         self._check_index_sets(res, "pad/sparse")
-        self._check_pad(res, "pad/sparse")
+        self._check_pad_latent(res, "pad/sparse")
 
 
 if __name__ == "__main__":

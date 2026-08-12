@@ -120,6 +120,21 @@ def _make_config(
 
 
 def _build(config, layer_number=0):
+    """Build the CSA-family attention for one layer.
+
+    Always ``"dsv4_hybrid_attention"``, i.e. the ``DSv4HybridSelfAttention`` /
+    ``CompressedSparseAttention`` branch of ``get_attention_spec``. The
+    hybrid-MLA (``csa_compress_ratios == -2``) branch, where
+    ``dsa_indexer_use_sparse_loss`` selects dense ``MHADSAWarmupAttention``
+    (phase 2) or ``MQALatentAttention`` (phase 3), is a *different* logical
+    attention type and is never reached from here -- no config in this file puts
+    a ``-2`` in ``csa_compress_ratios`` or sets ``hybrid_mla_attention``, so the
+    ``dsa_indexer_use_sparse_loss=False`` above only reaches the CSA layers'
+    own ``_resolve_topk_effective``. In production VHA does co-exist with the
+    ``-2`` layers, but ``MultiLatentAttention`` applies the postmix to
+    ``core_attn_out`` *after* the core attention returns, so it is agnostic to
+    which of the two the phase selected.
+    """
     model_parallel_cuda_manual_seed(_SEED)
     spec = get_attention_spec(
         config=config,

@@ -887,14 +887,25 @@ class TransformerConfig(ModelParallelConfig):
 
     - ``"mha"`` (default): ``kv_b_proj`` materialises per-head K/V and dense flash
       attention runs on them. Leaving the field unset keeps this behaviour.
-    - ``"mqa_dsa"``: latent MQA -- attention runs on the single shared
-      ``kv_lora_rank + qk_rope_head_dim`` latent head and a DSA (Lightning)
-      indexer selects the attended columns (forced local window + top-k).
+    - ``"mqa_dsa"``: a DSA (Lightning) indexer is trained on these layers. Which
+      *attention* backend runs is decided by ``dsa_indexer_use_sparse_loss``:
+      ``True`` (phase 3/4) is latent MQA on the single shared
+      ``kv_lora_rank + qk_rope_head_dim`` head, attending to the indexer's forced
+      local window + top-k; ``False`` (phase 2, the warmup) keeps the dense
+      per-head attention of ``"mha"`` and only bolts the indexer loss on, because
+      with no top-k on either side latent MQA would route a zero-sparsity
+      candidate set through the block-sparse kernel and pay a ``[b, s, s]`` index
+      table for nothing.
     - ``"mqa_full_causal"``: latent MQA with no indexer -- attend to the full
       per-document causal set.
 
-    Both ``mqa_*`` modes absorb the query against ``kv_b_proj.weight`` at
-    *runtime* (activation level, not weight level), so the parameter layout stays
+    The single predicate behind that split is
+    ``hybrid_mla_indexer.latent_mqa_enabled``, read both by the spec dispatch and
+    by ``MLASelfAttention.mqa_latent``, so the core attention and the activations
+    it is fed can never disagree.
+
+    Every mode that absorbs (``mqa_full_causal``, and ``mqa_dsa`` in the sparse
+    phase) absorbs the query against ``kv_b_proj.weight`` at *runtime* (activation level, not weight level), so the parameter layout stays
     byte-identical to ``"mha"`` and an MHA checkpoint loads unchanged. The only
     new weights are the DSA indexer's; ``"mqa_full_causal"`` adds none at all.
 
@@ -911,8 +922,9 @@ class TransformerConfig(ModelParallelConfig):
     table is ``[b, s, s]`` int32, so memory grows with the square of the sequence
     length (268 MB per layer at ``s=8192``).
 
-    Terminology: the ``mqa_*`` modes above are *latent MQA* (class
-    ``MQALatentAttention``, ``-2`` layers). A ``csa_compress_ratios`` entry of
+    Terminology: the modes above that absorb are *latent MQA* (class
+    ``MQALatentAttention``, ``-2`` layers); the warmup phase is
+    ``MHADSAWarmupAttention``. A ``csa_compress_ratios`` entry of
     ``-1`` is *CSA full-causal MQA* (class ``CompressedSparseAttention``) -- a
     different layer kind that this field does not touch.
     """
@@ -1194,7 +1206,7 @@ class TransformerConfig(ModelParallelConfig):
 
     Covers both indexer flavours of a dsv4-hybrid model: the ``CSAIndexer`` of
     the CSA layers (``1 < csa_compress_ratios[i] < 128``) and the ``DSAIndexer``
-    of the latent MQA layers (``== -2`` with ``hybrid_mla_attention="mqa_dsa"``).
+    of the hybrid MLA layers (``== -2`` with ``hybrid_mla_attention="mqa_dsa"``).
 
     This is about the *checkpoint*, not the training strategy, and is therefore
     separate from ``train_indexer_only``:
@@ -1649,8 +1661,9 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"hybrid_mla_attention={self.hybrid_mla_attention!r} is invalid. "
                 "It must be one of: 'mha' (per-head K/V materialised, dense flash "
-                "attention -- the default), 'mqa_dsa' (latent MQA + DSA indexer "
-                "selecting window + top-k columns), or 'mqa_full_causal' (latent "
+                "attention -- the default), 'mqa_dsa' (DSA indexer; dense "
+                "attention while it warms up, then latent MQA on its window + "
+                "top-k columns), or 'mqa_full_causal' (latent "
                 "MQA with no indexer, full per-document causal set)."
             )
         if self.hybrid_mla_attention != "mha":
@@ -1682,13 +1695,14 @@ class TransformerConfig(ModelParallelConfig):
                 "exists to isolate absorption from sparsity, not to save memory."
             )
         if self.hybrid_mla_attention == "mqa_dsa":
-            # On the ``-2`` layers ``dsa_indexer_use_sparse_loss`` decides both
-            # the indexer-loss candidate set and the attention candidate set,
-            # because they are one decision: while the indexer is still being
-            # learned attention must not consume its ranking, so the warmup phase
-            # runs full-causal attention and a KL over the whole causal set --
-            # no top-k on either side. The two training phases are therefore
-            # fixed pairs, and the two mixed combinations are configuration
+            # On the ``-2`` layers ``dsa_indexer_use_sparse_loss`` decides the
+            # indexer-loss candidate set, the attention candidate set *and* the
+            # attention backend, because they are one decision: while the indexer
+            # is still being learned attention must not consume its ranking, so
+            # the warmup phase keeps the dense per-head attention of phase 1 and
+            # runs a KL over the whole causal set -- no top-k on either side, and
+            # therefore nothing for latent MQA to absorb. The two training phases
+            # are fixed pairs, and the two mixed combinations are configuration
             # mistakes rather than modes.
             if self.train_indexer_only and self.dsa_indexer_use_sparse_loss:
                 raise ValueError(
@@ -1710,8 +1724,8 @@ class TransformerConfig(ModelParallelConfig):
                 logger.warning(
                     "hybrid_mla_attention='mqa_dsa' with "
                     "dsa_indexer_use_sparse_loss=False runs the warmup shape "
-                    "(full per-document causal attention plus a KL over the "
-                    "whole causal set, no top-k anywhere) while every backbone "
+                    "(dense per-head attention plus a KL over the whole causal "
+                    "set, no top-k anywhere) while every backbone "
                     "parameter still trains. The "
                     "production warmup phase pairs it with "
                     "train_indexer_only=True; the sparse training phase pairs "
@@ -1790,17 +1804,29 @@ class TransformerConfig(ModelParallelConfig):
                         "hybrid MLA dimensions must be explicit positive integers; "
                         f"invalid fields: {', '.join(invalid)}"
                     )
-                if self.mqa_split_kv_b_proj and (
-                    self.hybrid_mla_attention
-                    not in ("mqa_dsa", "mqa_full_causal")
-                ):
-                    raise ValueError(
-                        "mqa_split_kv_b_proj=True only means "
-                        "anything for latent MQA, i.e. "
-                        "hybrid_mla_attention='mqa_dsa' or 'mqa_full_causal'; "
-                        "it splits those modes' kv_b_proj into standalone "
-                        "k_b_proj / v_b_proj absorption parameters."
+                if self.mqa_split_kv_b_proj:
+                    # Same predicate the layer itself uses, so the error can
+                    # never disagree with what gets built. Note the DSA warmup
+                    # phase is *not* latent MQA: it runs dense MHA and keeps
+                    # ``kv_b_proj``, so allowing the flag there would silently
+                    # change the parameter set at the warmup -> sparse switch.
+                    from paddlefleet.transformer.hybrid_mla_indexer import (
+                        latent_mqa_enabled,
                     )
+
+                    if not latent_mqa_enabled(self):
+                        raise ValueError(
+                            "mqa_split_kv_b_proj=True only means "
+                            "anything for latent MQA, i.e. "
+                            "hybrid_mla_attention='mqa_full_causal' or "
+                            "'mqa_dsa' with dsa_indexer_use_sparse_loss=True; "
+                            "it splits those modes' kv_b_proj into standalone "
+                            "k_b_proj / v_b_proj absorption parameters, while "
+                            "the dense phases keep kv_b_proj itself. Got "
+                            f"hybrid_mla_attention={self.hybrid_mla_attention!r},"
+                            " dsa_indexer_use_sparse_loss="
+                            f"{self.dsa_indexer_use_sparse_loss!r}."
+                        )
                 if self.mqa_split_kv_b_proj and getattr(
                     self, "enable_hy_sparse_attention", False
                 ):
@@ -1847,9 +1873,10 @@ class TransformerConfig(ModelParallelConfig):
                         )
                     if self.dsa_index_head_dim != 128:
                         raise ValueError(
-                            "hybrid_mla_attention='mqa_dsa' uses the cuDNN "
-                            "indexer, which requires index_head_dim=128, got "
-                            f"{self.dsa_index_head_dim}."
+                            "hybrid_mla_attention='mqa_dsa' runs the indexer "
+                            "through the cuDNN (sparse phase) / tilelang (warmup "
+                            "phase) kernels, which require index_head_dim=128, "
+                            f"got {self.dsa_index_head_dim}."
                         )
                     # ``index_n_heads`` is deliberately *not* pinned to 64 here.
                     # The warmup phase's tilelang indexer does need exactly 64
@@ -1858,7 +1885,7 @@ class TransformerConfig(ModelParallelConfig):
                     # enforcing it at config time would make every small-geometry
                     # unit fixture unrepresentable. The check lives at the first
                     # use instead --
-                    # ``MQALatentAttention._check_tilelang_full_candidate_support``
+                    # ``MHADSAWarmupAttention._check_tilelang_indexer_support``
                     # -- which still raises before any kernel launch.
                     if self.dsa_indexer_use_sparse_loss and (
                         self.dsa_index_topk % 128 != 0
@@ -1953,7 +1980,7 @@ class TransformerConfig(ModelParallelConfig):
                         "least one Indexer, and this config builds none, so there "
                         "would be no trainable parameter left. Either a CSA layer "
                         "(csa_dense_mode=False plus some 1 < csa_compress_ratios[i] "
-                        "< 128) or a latent MQA layer with a DSA indexer "
+                        "< 128) or a hybrid MLA layer with a DSA indexer "
                         "(hybrid_mla_attention='mqa_dsa' plus some "
                         "csa_compress_ratios[i] == -2). Got "
                         f"csa_dense_mode={self.csa_dense_mode}, "

@@ -24,12 +24,14 @@ with the kernel's ``-inf`` boundary. Two callers do not agree on that:
   *is* the ratio-causal limit (``csa_attention.get_valid_range``), and on the
   dense path ``shift_scores_to_local_window`` fills the tail with ``-inf``
   (``docmask_utils.py:137-182``), so nothing finite sits past ``seq_lens``.
-* hybrid MLA latent MQA + DSA: ``_indexer_valid_range`` deliberately clamps the
-  end ``csa_window_size`` *before* the diagonal, because the forced local window
-  already covers those tokens (``mqa_latent_attention.py:398-405``). On the THD
-  path the scores are the kernel's own document-causal ones, so columns in
-  ``[seq_lens, causal_len)`` are finite and ``topk`` will return them --
-  duplicating the window and, at the diagonal, leaking the query's own column.
+* hybrid MLA latent MQA + DSA (phase 3): ``_indexer_valid_range`` deliberately
+  clamps the end ``csa_window_size`` *before* the diagonal, because the forced
+  local window already covers those tokens
+  (``hybrid_mla_indexer.py:178-181``, called with ``window=self.window_size``
+  at ``mqa_latent_attention.py:550-558``). On the THD path the scores are the
+  kernel's own document-causal ones, so columns in ``[seq_lens, causal_len)``
+  are finite and ``topk`` will return them -- duplicating the window and, at
+  the diagonal, leaking the query's own column.
 
 Masking the columns before ``topk`` fixes the second caller. This file is the
 multi-card evidence for both halves of the claim, on the real kernels rather
@@ -40,7 +42,10 @@ than on a helper-level probe:
   bitwise, because nothing finite lives past ``seq_lens``.
 * ``TestHybridMLAColumnMaskLoadBearingCP``: the latent MQA + DSA layer under CP
   -- without the mask the top-k *does* return out-of-window columns, so the
-  no-op above is not a vacuous property of the helper.
+  no-op above is not a vacuous property of the helper. Its phase-2 subtest is a
+  different core attention entirely (dense MHA, ``mha_dsa_warmup_attention``),
+  driven through ``test_mqa_dsa_warmup_cp.run_warmup_cp``, and asserts the
+  helper is never reached at all.
 
 No CSA CP test reached this helper before: ``test_csa_attention_cp.py``'s
 real-kernel classes all run ``csa_indexer_backend="unfused"``, and its one cuDNN
@@ -68,6 +73,7 @@ import paddle.distributed as dist
 # same import style as ``test_mqa_dsa_warmup_cp`` reusing ``test_mqa_dsa_cp``.
 import test_csa_attention_cp as C
 import test_mqa_dsa_cp as H
+import test_mqa_dsa_warmup_cp as W
 
 import paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn as M
 from paddlefleet.transformer.csa_attention import CSADocMaskMetadata
@@ -88,9 +94,13 @@ DOC_ROW_END = [72] * 72 + [SQ_GLOBAL] * (SQ_GLOBAL - 72)
 
 
 def setUpModule():
-    # One fleet init for both harnesses; ``test_csa_attention_cp``'s builders
-    # only read its module globals, so mirroring them is enough.
-    H.setUpModule()
+    # One fleet init for all three harnesses; ``test_csa_attention_cp``'s
+    # builders only read its module globals, so mirroring them is enough.
+    # Going through ``W.setUpModule`` (which calls ``H.setUpModule`` and then
+    # clears ``parallel_state._CONTEXT_PARALLEL_GROUP``) is what keeps
+    # ``run_warmup_cp``'s CP=1 reference module out of the CP path -- the dense
+    # attention half reads that process-global group, not ``pg_collection.cp``.
+    W.setUpModule()
     C.CP_SIZE, C.CP_RANK, C.CP_GROUP = H.CP_SIZE, H.CP_RANK, H.CP_GROUP
 
 
@@ -312,8 +322,8 @@ class TestHybridMLAColumnMaskLoadBearingCP(unittest.TestCase):
     """The same mask is what keeps latent MQA + DSA inside its window.
 
     ``H._STRADDLE`` tiles ``s_global`` exactly, so ``doc_lens`` is handed to the
-    kernel and the THD path runs (``mqa_latent_attention.py:574-589``) -- the one
-    layout where the scores past ``seq_lens`` are still finite.
+    kernel and the THD path runs (``mqa_latent_attention.py:574-596``) -- the
+    one layout where the scores past ``seq_lens`` are still finite.
     """
 
     def _run(self, sparse_loss, loss_coeff):
@@ -324,6 +334,24 @@ class TestHybridMLAColumnMaskLoadBearingCP(unittest.TestCase):
                 loss_coeff=loss_coeff,
                 with_input_ids=loss_coeff > 0,
                 sparse_loss=sparse_loss,
+            )
+        return spy
+
+    def _run_warmup(self, loss_coeff):
+        """Phase 2 on its own harness: a dense MHA layer, not latent MQA.
+
+        ``H.run_core_cp`` can no longer drive this phase -- it builds an
+        ``MQALatentAttention`` and feeds the absorbed latent layout, while
+        ``dsa_indexer_use_sparse_loss=False`` now selects
+        ``MHADSAWarmupAttention`` (``hybrid_mla_indexer.py:59-60``). The
+        warmup suite's runner builds the right module and the per-head dense
+        inputs it wants.
+        """
+        with _spying() as spy:
+            W.run_warmup_cp(
+                H._STRADDLE,
+                loss_coeff=loss_coeff,
+                with_input_ids=loss_coeff > 0,
             )
         return spy
 
@@ -385,19 +413,21 @@ class TestHybridMLAColumnMaskLoadBearingCP(unittest.TestCase):
     def test_2_warmup_never_reaches_the_topk_helper(self):
         """Phase 2 never reaches this helper, so the column mask cannot apply.
 
-        ``_forward_warmup`` (``mqa_latent_attention.py:453-585``) supervises the
-        indexer over the **whole** per-document causal span: one *tilelang*
-        ``csa_indexer_topk_fwd`` with ``topk_effective=s_global`` and
-        ``window=0`` (``mqa_latent_attention.py:524-541``), imported directly
-        rather than through ``csa_indexer_backend``. So the cuDNN helper this
-        file spies on -- the one that carries the column mask -- is not called
-        on either the attention or the loss side, and with no forced window
-        there is no window duplication for a mask to prevent. Asserted rather
-        than dropped because it is the sharpest statement of the phase-2
-        contract, and because it bounds ``test_1``'s claim: the mask is
-        load-bearing for phase 3 only.
+        The warmup phase is dense MHA plus an indexer
+        (``MHADSAWarmupAttention``): its attention half is
+        ``DotProductAttention.forward``
+        (``mha_dsa_warmup_attention.py:179-198``), which selects no columns at
+        all, and its KL runs one *tilelang* ``csa_indexer_topk_fwd`` with
+        ``topk_effective=s_global`` and ``window=0``
+        (``mha_dsa_warmup_attention.py:283-300``), imported directly rather
+        than through ``csa_indexer_backend``. So the cuDNN helper this file
+        spies on -- the one that carries the column mask -- is not called on
+        either side, and with no forced window there is no window duplication
+        for a mask to prevent. Asserted rather than dropped because it is the
+        sharpest statement of the phase-2 contract, and because it bounds
+        ``test_1``'s claim: the mask is load-bearing for phase 3 only.
         """
-        spy = self._run(sparse_loss=False, loss_coeff=0.1)
+        spy = self._run_warmup(loss_coeff=0.1)
         totals = self._report(spy, "mqa_dsa/warmup")
         self.assertEqual(
             totals["rows"],

@@ -38,8 +38,9 @@ the full-MLA integration):
 4. The selected column set: the sparse kernel's ``token_indices`` under CP must
    equal the reference's rows for this rank.
 5. Indexer-loss normalisation, masked (global denominator) and unmasked
-   (``/cp_size`` on the phase-3 path), and the phase-2
-   ``dsa_indexer_use_sparse_loss=False`` full-causal KL.
+   (``/cp_size``), on the phase-3 sparse path. The phase-2 warmup path is a
+   different core attention (dense MHA, ``mha_dsa_warmup_attention.py``) and is
+   covered by ``test_mqa_dsa_warmup_cp.py``.
 6. The attention sink under CP.
 7. The ``cp_balance_mode`` guard.
 
@@ -61,6 +62,7 @@ import paddle.distributed as dist
 from paddle.distributed import fleet
 
 from paddlefleet.transformer.dsa_attention import DSAIndexerLossLoggingHelper
+from paddlefleet.transformer.hybrid_mla_indexer import latent_mqa_enabled
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(
@@ -123,8 +125,9 @@ def setUpModule():
 
 def _build(mode, cp_group, loss_coeff=0.0, sink=None, sparse_loss=True, seed=7):
     """CP=1 reference (``cp_group is None``) or CP layer, identical weights."""
-    cfg = U._create_mqa_config(mode=mode, loss_coeff=loss_coeff)
-    cfg.dsa_indexer_use_sparse_loss = sparse_loss
+    cfg = U._create_mqa_config(
+        mode=mode, loss_coeff=loss_coeff, sparse_loss=sparse_loss
+    )
     cfg.cp_balance_mode = "contiguous_allgather"
     # Production EB dataflow hands every rank the *global* input_ids, which is
     # what ``_indexer_loss_mask`` assumes when this flag is set
@@ -132,6 +135,17 @@ def _build(mode, cp_group, loss_coeff=0.0, sink=None, sparse_loss=True, seed=7):
     cfg.experimental_dataflow = True
     cfg.pad_token_id = 0
     cfg.context_parallel_size = 1 if cp_group is None else cp_group.nranks
+    # This harness feeds the *latent* layout (one 576-wide key head plus
+    # ``v_b_proj_weight``, ``value=None``) and reads the block-sparse kernel's
+    # index table out of ``U._CAPTURED``, so it can only drive latent MQA. The
+    # phase-2 warmup backend is dense per-head MHA and has its own runner,
+    # ``test_mqa_dsa_warmup_cp.run_warmup_cp``.
+    assert latent_mqa_enabled(cfg), (
+        f"this harness cannot drive hybrid_mla_attention="
+        f"{cfg.hybrid_mla_attention!r} with dsa_indexer_use_sparse_loss="
+        f"{sparse_loss!r}: that selects the dense MHADSAWarmupAttention "
+        "(hybrid_mla_indexer.py:59-60) -- use test_mqa_dsa_warmup_cp instead"
+    )
     paddle.seed(seed)
     return U._build_module(
         cfg,
@@ -190,12 +204,12 @@ def _rel(a, e):
 def _logged_indexer_loss(layer_number=1):
     """The indexer loss this layer just pushed into the logging tracker.
 
-    ``_forward_warmup`` / ``_forward_sparse`` reduce the KL with the coefficient
-    and denominator their phase picked (phase 2 always the global row count;
-    phase 3 the global valid-row count when masked, ``/cp_size`` when not) and
-    hand exactly that scalar to ``DSAIndexerLossLoggingHelper``, so the tracker
-    is a direct read of the normalisation -- no gradient indirection. ``0.0``
-    when the step attached no loss.
+    ``MQALatentAttention._forward_sparse`` reduces the KL with the coefficient
+    and denominator its phase picked (the global valid-row count when masked,
+    ``/cp_size`` when not) and hands exactly that scalar to
+    ``DSAIndexerLossLoggingHelper``, so the tracker is a direct read of the
+    normalisation -- no gradient indirection. ``0.0`` when the step attached no
+    loss.
     """
     values = DSAIndexerLossLoggingHelper.tracker.get("values")
     if values is None:
@@ -536,8 +550,13 @@ class TestMQADSACP(unittest.TestCase):
         to land on the CP=1 reference. A per-rank denominator is off by
         ``cp_size`` (or by the pad imbalance, which ``_input_ids`` puts on the
         last rank only) and fails here.
+
+        Phase 2 (``sparse_loss=False``) is a different core attention entirely
+        and its own normalisation sweep lives in
+        ``test_mqa_dsa_warmup_cp.py::TestWarmupCP::test_4``, which additionally
+        reads the coefficient handed to the backward.
         """
-        for masked, sparse in ((True, True), (False, True), (True, False)):
+        for masked, sparse in ((True, True), (False, True)):
             with self.subTest(masked=masked, sparse_loss=sparse):
                 res = run_core_cp(
                     "mqa_dsa",
@@ -560,21 +579,27 @@ class TestMQADSACP(unittest.TestCase):
 
         The hybrid model's HCA layers assert the same mode
         (``dsv4_hybrid_attention.py:607-611``); the MQA layer must refuse the
-        others rather than silently attend against a permuted KV.
+        others rather than silently attend against a permuted KV. Swept over
+        ``dsa_indexer_use_sparse_loss`` because the guard now lives in the mixin
+        both phases share (``hybrid_mla_indexer.py:94-103``), so both core
+        attentions have to raise -- phase 2 from
+        ``MHADSAWarmupAttention.__init__``'s
+        ``_init_hybrid_mla_cp_state`` call (``mha_dsa_warmup_attention.py:128``).
         """
-        cfg = U._create_mqa_config(mode="mqa_dsa")
-        cfg.context_parallel_size = CP_SIZE
-        for mode in ("p2p", "zigzag", None):
-            with self.subTest(cp_balance_mode=mode):
-                cfg.cp_balance_mode = mode
-                with self.assertRaises(NotImplementedError):
-                    U._build_module(
-                        cfg,
-                        bf16=True,
-                        pg_collection=types.SimpleNamespace(
-                            tp=None, cp=CP_GROUP
-                        ),
-                    )
+        for sparse_loss in (True, False):
+            cfg = U._create_mqa_config(mode="mqa_dsa", sparse_loss=sparse_loss)
+            cfg.context_parallel_size = CP_SIZE
+            for mode in ("p2p", "zigzag", None):
+                with self.subTest(cp_balance_mode=mode, sparse=sparse_loss):
+                    cfg.cp_balance_mode = mode
+                    with self.assertRaises(NotImplementedError):
+                        U._build_module(
+                            cfg,
+                            bf16=True,
+                            pg_collection=types.SimpleNamespace(
+                                tp=None, cp=CP_GROUP
+                            ),
+                        )
 
 
 if __name__ == "__main__":

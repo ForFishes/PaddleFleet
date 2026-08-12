@@ -14,18 +14,28 @@
 
 """Unit tests for :mod:`paddlefleet.transformer.mqa_latent_attention`.
 
-``hybrid_mla_attention`` set to ``"mqa_dsa"`` or ``"mqa_full_causal"`` turns the
-hybrid MLA (``csa_compress_ratios == -2``) layers of a ``dsv4_hybrid`` model into
-:class:`MQALatentAttention` (latent MQA). The module picks its path from the
-sublayers spec, not from any config string:
+``hybrid_mla_attention`` decides which core attention the hybrid MLA
+(``csa_compress_ratios == -2``) layers of a ``dsv4_hybrid`` model run.
+:class:`MQALatentAttention` (latent MQA) owns exactly the two modes that attend
+to the **absorbed KV latent**, i.e. the ones that consume a sorted candidate
+set, and it picks between them from the sublayers spec rather than from any
+config string:
 
 * ``MQALatentAttentionSublayersSpec(indexer=None)`` -- per-document full-causal
   attention on the latent, mathematically equal to MHA. This is what production
-  builds for ``"mqa_full_causal"``; ``gpt_layer_specs`` always attaches an
-  indexer for ``"mqa_dsa"``. The absorption-equivalence tests here drive it by
-  constructing the layer directly with ``indexer=None``.
-* an indexer spec -- forced local window + Lightning-indexer top-k, i.e. DSA on
-  the KV latent.
+  builds for ``"mqa_full_causal"``. The absorption-equivalence tests here drive
+  it by constructing the layer directly with ``indexer=None``.
+* an indexer spec **plus** ``dsa_indexer_use_sparse_loss=True`` (phase 3/4) --
+  forced local window + Lightning-indexer top-k, i.e. DSA on the KV latent.
+
+The other two modes are not this class, and
+``hybrid_mla_indexer.latent_mqa_enabled`` is the single predicate that keeps the
+spec dispatch and ``MLASelfAttention.mqa_latent`` in step about it: ``"mha"``
+and ``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=False`` (phase 2, the DSA
+warmup) both run dense per-head attention, the latter in
+``mha_dsa_warmup_attention.MHADSAWarmupAttention``. An indexer on this class
+with the sparse loss off is therefore an **error state**, not a phase, and
+``_phase()`` raises for it.
 
 Coverage:
   1. Guards -- unsupported configurations fail loudly (no GPU needed).
@@ -45,9 +55,12 @@ Coverage:
      path) and takes a finite non-zero fp32 gradient. There is a single sink
      switch now, so the config no longer rejects any combination.
   7. The phase-2 (warmup) shape of ``"mqa_dsa"``, selected by
-     ``dsa_indexer_use_sparse_loss=False``: attention consumes the full
-     per-document causal table (bit-identical to ``"mqa_full_causal"``) while
-     the indexer's top-k serves the wide KL loss only.
+     ``dsa_indexer_use_sparse_loss=False``: it is the **dense** backend
+     ``MHADSAWarmupAttention``, bit-identical to phase 1's attention, building
+     no index table at all while the indexer's KL spans every causal column.
+     Plus the two guards that keep the split honest: ``latent_mqa_enabled`` over
+     all four config combinations, and ``MQALatentAttention`` refusing to run
+     that phase itself.
   8. Migration: the renamed config keys (``non_absorbed_mqa*``,
      ``csa_train_indexer_only``, ``csa_indexer_init_from_scratch``) ship without
      an alias, so a stale config must raise rather than be absorbed into a
@@ -74,9 +87,18 @@ from paddlefleet.transformer.csa_attention import (
     _derive_csa_doc_boundaries,
 )
 from paddlefleet.transformer.dsa_attention import DSAIndexerLossLoggingHelper
+from paddlefleet.transformer.enums import AttnMaskType
+from paddlefleet.transformer.hybrid_mla_indexer import (
+    HybridMLAIndexerMixin,
+    latent_mqa_enabled,
+)
+from paddlefleet.transformer.mha_dsa_warmup_attention import (
+    MHADSAWarmupAttention,
+)
 from paddlefleet.transformer.mqa_latent_attention import (
     _LSE_INDEXER_TOPKS,
     MQALatentAttention,
+    MQALatentAttentionSublayersSpec,
     _HashableTensor,
 )
 from paddlefleet.transformer.transformer_config import TransformerConfig
@@ -84,6 +106,7 @@ from paddlefleet.transformer.transformer_config import TransformerConfig
 from .hybrid_mla_utils import (
     _CAPTURED,
     _GPU,
+    _WARMUP_TARGETS,
     DK,
     DV,
     HIDDEN,
@@ -96,9 +119,13 @@ from .hybrid_mla_utils import (
     WINDOW,
     H,
     _build_module,
+    _build_phase1_dense_module,
     _check_index_invariants,
     _create_mqa_config,
+    _dense_mha_reference,
     _dense_reference,
+    _indexer_layer_spec,
+    _make_dense_inputs,
     _make_inputs,
     _rel,
     _row_end,
@@ -123,6 +150,10 @@ _LAYOUTS = [
 def _full_causal_table(layout, seqlen):
     """The per-document full-causal ``[1, s, s]`` table, from the production
     builder itself -- it is a pure integer function of the document bounds.
+
+    Still the attention table of the indexer-less latent path; for phase 2 it is
+    now only the *analytic* per-document causal set (that phase materialises no
+    table at all), which is what its indexer KL must span.
     """
     row_end = _row_end(layout, seqlen)
     doc_start, _, is_valid, _, _ = _derive_csa_doc_boundaries(row_end, seqlen)
@@ -135,6 +166,34 @@ def _full_causal_table(layout, seqlen):
 def _fp32(tensor):
     """bf16 -> fp32 numpy; the widening is exact, so bit equality survives."""
     return tensor.cast("float32").numpy()
+
+
+def _build_latent_warmup_module(loss_coeff=0.01):
+    """A ``MQALatentAttention`` in the (now illegal) phase-2 combination.
+
+    ``_build_module`` cannot produce this: it dispatches on the production
+    predicate ``latent_mqa_enabled``, which sends ``"mqa_dsa"`` +
+    ``dsa_indexer_use_sparse_loss=False`` to ``MHADSAWarmupAttention``. Reaching
+    the guard therefore means building the latent class by hand -- which is
+    exactly the situation the guard is for: a spec change that forgets the
+    predicate must fail loudly instead of quietly running a zero-sparsity
+    block-sparse kernel.
+
+    Local helper on purpose: ``hybrid_mla_utils`` is shared with other suites.
+    """
+    config = _create_mqa_config(
+        "mqa_dsa", loss_coeff=loss_coeff, sparse_loss=False
+    )
+    return MQALatentAttention(
+        config=config,
+        sublayers_spec=MQALatentAttentionSublayersSpec(
+            indexer=_indexer_layer_spec()
+        ),
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        k_channels=K_CHANNELS,
+    )
 
 
 class TestMQAGuards(unittest.TestCase):
@@ -210,10 +269,59 @@ class TestMQAGuards(unittest.TestCase):
 
 class TestMQAIndexRanges(unittest.TestCase):
     """The forced window and the indexer candidate range partition the causal
-    set: no overlap (would double-count) and no gap (would waste budget)."""
+    set: no overlap (would double-count) and no gap (would waste budget).
+
+    ``_indexer_valid_range`` now lives on the shared
+    ``HybridMLAIndexerMixin``, because both DSA phases build a candidate range
+    from it, and its ``window`` argument became a **required positional** one
+    placed before ``position_offset`` (the warmup phase passes ``0``). It is
+    reached here through the latent class, which is one of its two callers.
+    """
 
     def setUp(self):
         self.module = _build_module(_create_mqa_config("mqa"))
+
+    def test_the_range_builder_is_the_shared_mixins(self):
+        """Retargeted, not deleted: the method moved out of the latent class.
+
+        Both DSA phases must clamp the candidate range identically, so a copy
+        per class would be a silent divergence risk. Pin the ownership, and pin
+        that ``window`` is mandatory -- it used to default to
+        ``self.window_size``, so an updated caller that forgets it would
+        otherwise keep working while a phase-2 caller silently subtracted a
+        128-wide window it does not have.
+        """
+        self.assertIs(
+            MQALatentAttention._indexer_valid_range,
+            HybridMLAIndexerMixin._indexer_valid_range,
+        )
+        self.assertIs(
+            MHADSAWarmupAttention._indexer_valid_range,
+            HybridMLAIndexerMixin._indexer_valid_range,
+        )
+        seqlen = 32
+        args = self._doc_bounds([seqlen], seqlen)
+        with self.assertRaises(TypeError):
+            self.module._indexer_valid_range(seqlen, *args)
+        # ``window=0`` (what the warmup phase passes) is the whole per-document
+        # causal span, diagonal included; the sparse phase's ``WINDOW`` cuts the
+        # trailing window off the same range.
+        valid_range, row_empty = self.module._indexer_valid_range(
+            seqlen, *args, 0
+        )
+        vr = valid_range.numpy()[0]
+        for q in range(seqlen):
+            self.assertEqual((int(vr[q, 0]), int(vr[q, 1])), (0, q + 1))
+        self.assertFalse(bool(row_empty.numpy().any()))
+
+    @staticmethod
+    def _doc_bounds(layout, seqlen):
+        """``(doc_start, doc_len, is_valid)`` for one layout."""
+        row_end = _row_end(layout, seqlen)
+        doc_start, doc_len, is_valid, _, _ = _derive_csa_doc_boundaries(
+            row_end, seqlen
+        )
+        return doc_start, doc_len, is_valid
 
     def test_window_and_indexer_range_partition_causal_set(self):
         seqlen = 256
@@ -227,7 +335,7 @@ class TestMQAIndexRanges(unittest.TestCase):
                     1, seqlen, WINDOW, doc_start, is_valid
                 ).numpy()
                 valid_range, row_empty = self.module._indexer_valid_range(
-                    seqlen, doc_start, doc_len, is_valid
+                    seqlen, doc_start, doc_len, is_valid, WINDOW
                 )
                 self._assert_partition(
                     window,
@@ -357,8 +465,9 @@ class TestHybridMLAConfig(unittest.TestCase):
     def test_warmup_phase_needs_no_index_topk(self):
         """Phase 2 must not be forced to carry a top-k budget.
 
-        ``_forward_warmup`` never selects a top-k, so a kernel-illegal (or
-        simply absent, hence default) ``index_topk`` must not block startup --
+        ``MHADSAWarmupAttention`` never selects a top-k on either side, so a
+        kernel-illegal (or simply absent, hence default) ``index_topk`` must not
+        block startup --
         while the sparse phase still rejects it. The production phase-2
         ``model_config.json`` relies on this: it ships no ``index_topk`` at all.
         """
@@ -428,12 +537,26 @@ class TestHybridMLAConfig(unittest.TestCase):
         # to split, so silently accepting it would hide a mis-set config.
         with self.assertRaisesRegex(ValueError, "only means"):
             TransformerConfig(**self._kwargs(mqa_split_kv_b_proj=True))
-        for mode in ("mqa_dsa", "mqa_full_causal"):
+        # The DSA warmup phase is one of those dense paths: it keeps kv_b_proj,
+        # so accepting the flag there would silently change the parameter set
+        # at the warmup -> sparse switch instead of at a config edit.
+        with self.assertRaisesRegex(ValueError, "only means"):
+            TransformerConfig(
+                **self._mqa_dsa_kwargs(
+                    mqa_split_kv_b_proj=True,
+                    dsa_indexer_use_sparse_loss=False,
+                )
+            )
+        for mode, extra in (
+            ("mqa_dsa", {"dsa_indexer_use_sparse_loss": True}),
+            ("mqa_full_causal", {}),
+        ):
             with self.subTest(mode=mode):
                 config = TransformerConfig(
                     **self._mqa_dsa_kwargs(
                         hybrid_mla_attention=mode,
                         mqa_split_kv_b_proj=True,
+                        **extra,
                     )
                 )
                 self.assertTrue(config.mqa_split_kv_b_proj)
@@ -447,6 +570,7 @@ class TestHybridMLAConfig(unittest.TestCase):
             TransformerConfig(
                 **self._mqa_dsa_kwargs(
                     hybrid_mla_attention="mqa_dsa",
+                    dsa_indexer_use_sparse_loss=True,
                     mqa_split_kv_b_proj=True,
                     enable_hy_sparse_attention=True,
                 )
@@ -585,6 +709,129 @@ class TestHybridMLAConfig(unittest.TestCase):
         self.assertEqual(config.hybrid_mla_attention, "mqa_dsa")
         self.assertTrue(config.train_indexer_only)
         self.assertTrue(config.indexer_init_from_scratch)
+
+
+class TestLatentMqaEnabledPredicate(unittest.TestCase):
+    """``latent_mqa_enabled`` (``hybrid_mla_indexer.py:37-61``) decides alone.
+
+    Both the spec dispatch (``gpt_layer_specs.py``) and
+    ``MLASelfAttention.mqa_latent`` read this one predicate, so if it drifts the
+    spec builds one core attention while the enclosing layer feeds it the other
+    one's activations -- absorbed latents into dense MHA, or per-head K/V into
+    the block-sparse kernel. Pinned over every combination that reaches it.
+    """
+
+    @staticmethod
+    def _dsv4(**overrides):
+        return TransformerConfig(**TestHybridMLAConfig._kwargs(**overrides))
+
+    def test_non_dsv4_models_never_run_latent_mqa(self):
+        config = TransformerConfig(
+            num_hidden_layers=2, hidden_size=HIDDEN, num_attention_heads=H
+        )
+        self.assertEqual(config.hybrid_mla_attention, "mha")
+        self.assertIs(latent_mqa_enabled(config), False)
+        # The variant gate is checked before the mode, so it holds even for a
+        # mode that would otherwise say True. ``__post_init__`` rejects that
+        # pair outright (transformer_config.py:1628-1649), hence the
+        # post-construction assignment: defence in depth, not a live config.
+        config.hybrid_mla_attention = "mqa_full_causal"
+        self.assertIs(latent_mqa_enabled(config), False)
+
+    def test_mha_mode_is_dense_even_on_dsv4(self):
+        self.assertIs(latent_mqa_enabled(self._dsv4()), False)
+
+    def test_mqa_full_causal_is_latent(self):
+        config = self._dsv4(hybrid_mla_attention="mqa_full_causal")
+        self.assertIs(latent_mqa_enabled(config), True)
+        # No indexer in this mode, so the sparse-loss switch is irrelevant.
+        config.dsa_indexer_use_sparse_loss = False
+        self.assertIs(latent_mqa_enabled(config), True)
+
+    def test_mqa_dsa_is_latent_only_in_the_sparse_phase(self):
+        for sparse_loss in (False, True):
+            with self.subTest(dsa_indexer_use_sparse_loss=sparse_loss):
+                config = TransformerConfig(
+                    **TestHybridMLAConfig._mqa_dsa_kwargs(
+                        dsa_indexer_use_sparse_loss=sparse_loss
+                    )
+                )
+                self.assertIs(latent_mqa_enabled(config), sparse_loss)
+                # The unit fixture must agree with the production config or
+                # every phase-2 test below would exercise the wrong backend.
+                self.assertIs(
+                    latent_mqa_enabled(
+                        _create_mqa_config("mqa_dsa", sparse_loss=sparse_loss)
+                    ),
+                    sparse_loss,
+                )
+
+
+class TestLatentMqaRefusesTheWarmupPhase(unittest.TestCase):
+    """An indexer with the sparse loss off is an error state, not a phase.
+
+    ``MQALatentAttention`` used to *implement* phase 2 (``_forward_warmup``).
+    Now that phase runs dense MHA in ``MHADSAWarmupAttention``, so this class
+    seeing that combination means the dispatch predicate was bypassed -- which
+    must fail loudly rather than quietly build a ``[b, s, s]`` index table and
+    feed it to the block-sparse kernel at zero sparsity
+    (``mqa_latent_attention.py:279-288``).
+    """
+
+    S = 64
+
+    def _assert_message(self, message):
+        for fragment in (
+            "dsa_indexer_use_sparse_loss=False",
+            "DSA warmup phase",
+            "dense MHA",
+            "MHADSAWarmupAttention",
+        ):
+            self.assertIn(fragment, message)
+
+    def test_phase_raises_and_names_the_dense_backend(self):
+        module = _build_latent_warmup_module()
+        self.assertIsNotNone(module.indexer)
+        self.assertFalse(module.indexer_use_sparse_loss)
+        with self.assertRaises(ValueError) as raised:
+            module._phase()
+        self._assert_message(str(raised.exception))
+
+    def test_the_forward_refuses_before_touching_a_kernel(self):
+        """The guard sits in front of the whole sparse path, not inside it.
+
+        ``_phase`` is consulted after the document bounds and before any index
+        table or kernel launch (``mqa_latent_attention.py:372``), so this needs
+        no GPU: a well-formed call that would previously have run the warmup
+        forward now raises instead.
+        """
+        module = _build_latent_warmup_module()
+        module.eval()
+        query = paddle.zeros([1, self.S, H, DK], dtype="float32")
+        key = paddle.zeros([1, self.S, 1, DK], dtype="float32")
+        w_v = paddle.zeros([DV, H, V_HEAD_DIM], dtype="float32")
+        with self.assertRaises(ValueError) as raised:
+            module(
+                query,
+                key,
+                None,
+                None,
+                _row_end([self.S], self.S),
+                v_b_proj_weight=w_v,
+                x=paddle.zeros([1, self.S, HIDDEN], dtype="float32"),
+                qr=paddle.zeros([1, self.S, Q_LORA], dtype="float32"),
+            )
+        self._assert_message(str(raised.exception))
+
+    def test_the_two_surviving_phases_still_resolve(self):
+        # The guard must not have swallowed the legal states: no indexer is
+        # full causal, sparse loss on is the sparse phase.
+        latent = _build_module(_create_mqa_config("mqa"))
+        self.assertIsNone(latent.indexer)
+        self.assertEqual(latent._phase(), "full_causal")
+        sparse = _build_module(_create_mqa_config("mqa_dsa", loss_coeff=0.01))
+        self.assertIsNotNone(sparse.indexer)
+        self.assertEqual(sparse._phase(), "sparse")
 
 
 @_GPU
@@ -842,26 +1089,20 @@ class TestMQADSA(unittest.TestCase):
         """``dsa_indexer_use_sparse_loss`` picks the whole training phase.
 
         On these uncompressed ``-2`` layers the switch is one decision with two
-        effects (``MQALatentAttention._phase``), not just the KL width it selects
+        effects (``MQALatentAttention._phase``), not just the KL width it picks
         for the CSA layers of the same model
         (``_resolve_csa_indexer_loss_topk_effective``):
 
-        * ``False`` -- phase 2 (warmup, ``_forward_warmup``). Attention consumes
-          the **full per-document causal** table, because a freshly initialised
-          indexer's ranking must not steer attention yet, and the KL is scored
-          over that same full causal set -- so ``_attn_target``, the top-k KL
-          target builder, is never called at all. (It used to be called with a
-          *widened* top-k table; at the production ``index_topk=2048`` that
-          widening degenerated back into the phase-3 table, which is why the
-          phase now shares no loss code with phase 3.)
         * ``True`` -- phase 3 (``_forward_sparse``). Attention consumes
           ``window + index_topk`` and the KL is restricted to that same set, so
           ``_attn_target`` is called once per step at exactly ``index_topk``.
-
-        Both column sets are asserted. The ``False`` attention table is *exactly*
-        assertable: it is ``_build_full_causal_indices``, a pure integer function
-        of the document bounds with no floating-point scoring in it, so it is
-        reproducible and equal to the builder's own output element for element.
+        * ``False`` -- phase 2, which is no longer this class's phase: it runs
+          dense MHA in ``MHADSAWarmupAttention`` (see
+          ``TestMQADSAWarmupPhase``). Flipping the switch on a live latent
+          module therefore *raises* instead of widening the attention table to
+          the full per-document causal set. That inversion is the point: the
+          ``[b, s, s]`` table the old ``False`` branch built for a zero-sparsity
+          kernel does not exist any more.
 
         The ``True`` path stays statistical, which is the pre-existing measured
         fact this test still records: on a single full-length document neither
@@ -878,21 +1119,19 @@ class TestMQADSA(unittest.TestCase):
         inner_target = self.module._attn_target
 
         def recording_target(query_, kv_, kl_columns, lse_indexer=None):
-            # The KL's column set is the indexer's candidate set: the top-k in
-            # the sparse phase, every causal column in warmup. The forced window
-            # is never in it.
+            # The KL's column set is the indexer's candidate set, i.e. the
+            # top-k. The forced window is never in it.
             loss_widths.append(int(kl_columns.shape[-1]))
             return inner_target(query_, kv_, kl_columns, lse_indexer)
 
         self.module._attn_target = recording_target
 
-        def run(sparse):
+        def run():
             _CAPTURED.clear()
             DSAIndexerLossLoggingHelper.tracker.clear()
             tensors = [t.clone() for t in (query, key, x, qr)]
             for tensor in tensors:
                 tensor.stop_gradient = False
-            self.module.indexer_use_sparse_loss = sparse
             self.module.train()
             out = self.module(
                 tensors[0],
@@ -910,37 +1149,34 @@ class TestMQADSA(unittest.TestCase):
                 float(DSAIndexerLossLoggingHelper.tracker["values"][0]),
             )
 
-        idx_a, loss_sparse = run(True)
-        idx_b, _ = run(True)
-        idx_full, loss_full = run(False)
+        idx_a, loss_sparse = run()
+        idx_b, _ = run()
 
-        # The KL column set: exactly ``index_topk`` under ``True``; under
-        # ``False`` the same builder is reached but over the whole causal span,
-        # so the width is ``s``.
-        self.assertEqual(loss_widths, [INDEX_TOPK, INDEX_TOPK, seqlen])
-        # The KL never scores the forced window: its width is exactly the
-        # indexer's candidate budget, not ``WINDOW + INDEX_TOPK``.
+        # The KL column set is exactly ``index_topk`` wide...
+        self.assertEqual(loss_widths, [INDEX_TOPK, INDEX_TOPK])
+        # ...and never covers the forced window, i.e. it is the indexer's own
+        # candidate budget, not ``WINDOW + INDEX_TOPK``.
         self.assertNotIn(WINDOW + INDEX_TOPK, loss_widths)
 
-        # The attention table: window + top-k under ``True``, the full causal
-        # table (width ``s``) under ``False``.
+        # The attention table is window + top-k.
         for table in (idx_a, idx_b):
             self.assertEqual(int(table.shape[-1]), WINDOW + INDEX_TOPK)
-        self.assertEqual(list(idx_full.shape), [1, seqlen, seqlen])
-        np.testing.assert_array_equal(
-            idx_full, _full_causal_table([seqlen], seqlen)
-        )
 
-        # The measured identical-call drift of the ``True`` table, kept as the
-        # reason its width -- not its contents -- is what gets asserted.
+        # The measured identical-call drift of the table, kept as the reason its
+        # width -- not its contents -- is what gets asserted.
         drift = float((idx_a != idx_b).mean())
         self.assertLess(drift, 0.05)
-
         self.assertGreater(loss_sparse, 0.0)
-        self.assertGreater(loss_full, 0.0)
-        # A wider renormalisation set means a different KL; equal values would
-        # mean the switch never reached the loss.
-        self.assertGreater(abs(loss_full - loss_sparse), 1e-6)
+
+        # The other half of the switch: no wider table, a refusal. ``_phase`` is
+        # read live, so the flip takes effect on this same module.
+        self.module.indexer_use_sparse_loss = False
+        _CAPTURED.clear()
+        with self.assertRaisesRegex(ValueError, "MHADSAWarmupAttention"):
+            run()
+        self.assertEqual(_CAPTURED, [], "an index table was built anyway")
+        self.assertEqual(loss_widths, [INDEX_TOPK, INDEX_TOPK])
+        self.module.indexer_use_sparse_loss = True
 
     def test_recompute_double_forward_is_consistent(self):
         """Reentrant recompute runs the layer twice: pass 1 under ``no_grad``.
@@ -1061,15 +1297,24 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
     """Phase 2 of ``"mqa_dsa"``: ``dsa_indexer_use_sparse_loss=False``.
 
     The indexer is still being learned, so attention must not consume its
-    ranking: it attends to the full per-document causal set (bit-identical to
-    ``hybrid_mla_attention="mqa_full_causal"``) while the indexer's top-k feeds
-    the wide KL loss only. ``TestMQADSA`` covers the phase-3 shape
-    (``True``), where attention consumes ``window + index_topk``.
+    ranking -- and with no top-k on either side there is nothing for absorbed
+    latent MQA to save. So this phase runs **phase 1's dense MHA** with the
+    indexer bolted on (``mha_dsa_warmup_attention.MHADSAWarmupAttention``),
+    which ``latent_mqa_enabled`` selects (``TestLatentMqaEnabledPredicate``)
+    and which ``MQALatentAttention`` now refuses to impersonate
+    (``TestLatentMqaRefusesTheWarmupPhase``). ``TestMQADSA`` covers phase 3,
+    where attention does consume ``window + index_topk``.
 
-    Kept as its own class rather than folded into ``TestMQADSA``: the module
-    fixture differs (the switch is off from construction, not flipped mid-test),
-    and everything here is an exact assertion, because the full-causal table is
-    integer-only.
+    Kept in this file although the backend moved: what these tests are about is
+    the phase boundary, and the phase-3 fixtures they contrast with live here.
+    Two class-wide inversions of the old assertions, both consequences of the
+    dense backend:
+
+    * ``_CAPTURED`` (the block-sparse kernel's ``token_indices``) must stay
+      **empty** -- no ``[b, s, s]`` index table is built at all, where the old
+      warmup built one and then walked all ``s`` columns at zero sparsity;
+    * the reference is ``_build_phase1_dense_module``, a plain
+      ``DotProductAttention``, and agreement with it is **bit** equality.
     """
 
     SEQLEN = 256
@@ -1086,97 +1331,121 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
 
     def setUp(self):
         _CAPTURED.clear()
+        _WARMUP_TARGETS.clear()
         DSAIndexerLossLoggingHelper.tracker.clear()
-        self.module = self._build_warmup()
+        self.config = _create_mqa_config(
+            "mqa_dsa", loss_coeff=0.01, sparse_loss=False
+        )
+        self.module = self._build_warmup(self.config)
         self.row_end = _row_end(self.LAYOUT, self.SEQLEN)
 
     @staticmethod
-    def _build_warmup():
-        """A ``"mqa_dsa"`` module with the switch off from construction."""
-        config = _create_mqa_config("mqa_dsa", loss_coeff=0.01)
-        config.dsa_indexer_use_sparse_loss = False
+    def _build_warmup(config):
+        """The dense phase-2 backend, picked by the production predicate."""
         module = _build_module(config, bf16=True)
+        assert isinstance(module, MHADSAWarmupAttention), type(module)
+        assert not isinstance(module, MQALatentAttention)
         assert module.indexer is not None
-        assert module.indexer_use_sparse_loss is False
         return module
 
     def _inputs(self, seed=0):
-        return _make_inputs(self.SEQLEN, seed=seed, with_hidden=True)
+        return _make_dense_inputs(self.SEQLEN, seed=seed)
 
-    def _call(self, module, tensors, w_v, training, differentiable=False):
+    def _ids(self):
+        """All-valid ``input_ids``; ``pad_token_id`` defaults to 0."""
+        return paddle.ones([1, self.SEQLEN], dtype="int64")
+
+    def _call(
+        self, module, tensors, training, differentiable=False, input_ids=None
+    ):
+        """The phase-2 call shape: per-head q/k/v plus the indexer's inputs.
+
+        ``attn_mask_type`` is explicit because ``DotProductAttention`` leaves
+        ``is_causal`` False when it is omitted, and the document mask alone
+        would then leave the upper triangle unmasked. ``input_ids`` is the only
+        kwarg the phase-1 reference does not take, so it is passed only when
+        given -- which is how ``MLASelfAttention`` forwards it too, gated on
+        ``accepts_input_ids``.
+        """
         module.train() if training else module.eval()
-        query, key, x, qr = tensors
+        query, key, value, x, qr = tensors
         if differentiable:
             for tensor in tensors:
                 tensor.stop_gradient = False
+        extra = {} if input_ids is None else {"input_ids": input_ids}
         return module(
             query,
             key,
-            None,
+            value,
             None,
             self.row_end,
-            v_b_proj_weight=w_v,
+            attn_mask_type=AttnMaskType.causal,
             x=x,
             qr=qr,
+            **extra,
         )
 
-    def test_attention_output_equals_the_indexer_less_full_causal_path(self):
-        """The core invariant: the indexer's *existence* must not move a bit.
+    def test_attention_output_is_bit_identical_to_phase_1(self):
+        """The core invariant, inverted: phase 2 *is* phase 1's attention.
 
-        Both paths call the same ``_build_full_causal_indices`` and then the
-        same sparse kernel, so the outputs must be bit-identical, not merely
-        close. Nothing needs weight copying: on this path attention consumes no
-        module parameter at all -- the query/key/``v_b_proj_weight`` are inputs
-        and ``softmax_offset`` is ``None`` in both -- so the only thing that
-        could differ is the index table. Asserted in both modes, so the
-        ``:495`` early exit and the full ``:600`` branch are each covered.
+        The old assertion compared against the indexer-less **latent** path.
+        The reference is now the dense ``DotProductAttention`` of phase 1
+        itself, and the claim is stronger: the whole attention half is
+        ``super().forward`` (``mha_dsa_warmup_attention.py:179-198``), so the
+        indexer loss is the only new thing. Nothing needs weight copying --
+        attention consumes no module parameter here (q/k/v are inputs and
+        ``softmax_offset`` is ``None`` in both) -- so a difference could only
+        come from the backend. Measured maxabs 0.0 on SM103 / FA4.
+
+        Asserted in eval and in train mode, i.e. with the indexer branch both
+        skipped (``mha_dsa_warmup_attention.py:199-200``) and taken.
         """
-        query, key, w_v, x, qr = self._inputs()
-        reference = _build_module(_create_mqa_config("mqa"), bf16=True)
-        self.assertIsNone(reference.indexer)
+        tensors = self._inputs()
+        reference = _build_phase1_dense_module(self.config, bf16=True)
         self.assertIsNone(reference.softmax_offset)
         self.assertIsNone(self.module.softmax_offset)
         self.assertEqual(self.module.softmax_scale, reference.softmax_scale)
-        reference.eval()
-        out_ref = _fp32(
-            self._call(reference, (query, key, x, qr), w_v, training=False)
-        )
+        out_ref = _fp32(self._call(reference, tensors, training=False))
         for training in (False, True):
             with self.subTest(training=training):
                 DSAIndexerLossLoggingHelper.tracker.clear()
-                tensors = [t.clone() for t in (query, key, x, qr)]
+                clones = [t.clone() for t in tensors]
                 out = self._call(
                     self.module,
-                    tensors,
-                    w_v,
+                    clones,
                     training=training,
                     differentiable=training,
+                    input_ids=self._ids(),
                 )
                 np.testing.assert_array_equal(_fp32(out), out_ref)
+        self.assertEqual(_CAPTURED, [], "the block-sparse kernel was reached")
 
-    def test_token_indices_are_the_full_causal_table(self):
-        """The captured table is ``[b, s, s]`` and element-wise equal to the
-        builder's own output, over several document layouts."""
-        query, key, w_v, x, qr = self._inputs()
+    def test_output_matches_the_fp32_dense_mha_reference(self):
+        """Independent check that the delegated half really is per-document
+        causal MHA, rather than merely equal to another copy of itself.
+
+        The document layouts are varied here rather than in the bit-identity
+        test because masking is what this one is about -- and no layout may
+        produce an index table.
+        """
+        tensors = self._inputs(seed=3)
+        query, key, value = tensors[0], tensors[1], tensors[2]
         for layout in ([self.SEQLEN], self.LAYOUT, [3, WINDOW, WINDOW + 1, 1]):
             with self.subTest(layout=layout):
                 self.row_end = _row_end(layout, self.SEQLEN)
                 _CAPTURED.clear()
-                self._call(
-                    self.module, (query, key, x, qr), w_v, training=False
+                out = self._call(self.module, tensors, training=False)
+                ref = _dense_mha_reference(
+                    query,
+                    key,
+                    value,
+                    self.row_end,
+                    self.module.softmax_scale,
                 )
-                table = _CAPTURED[-1]
-                self.assertEqual(
-                    list(table.shape), [1, self.SEQLEN, self.SEQLEN]
-                )
-                np.testing.assert_array_equal(
-                    table, _full_causal_table(layout, self.SEQLEN)
-                )
-                # ... and the table is sound in its own right: the whole causal
-                # set, no duplicate, nothing cross-document.
-                _check_index_invariants(
-                    self, table, self.row_end, self.SEQLEN, expect_full=True
-                )
+                # bf16 flashmask vs the fp32 reference: measured rel 1.969e-3
+                # at [100, 156]; 3.5e-3 keeps the phase-3 tests' margin.
+                self.assertLess(_rel(out, ref), 3.5e-3)
+                self.assertEqual(_CAPTURED, [], "an index table was built")
 
     def test_warmup_undoes_the_indexer_weight_prebake_for_tilelang(self):
         """The tilelang indexer re-applies ``head_dim**-0.5``, so the pre-bake
@@ -1217,13 +1486,16 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
             seen["probs"] = probs.cast("float32").numpy().copy()
             return columns, probs
 
-        query, key, w_v, x, qr = self._inputs()
-        tensors = [t.clone() for t in (query, key, x, qr)]
+        tensors = [t.clone() for t in self._inputs()]
         self.module._indexer_projections = recording_proj
         tl_mod.csa_indexer_topk_fwd = recording_tl
         try:
             self._call(
-                self.module, tensors, w_v, training=True, differentiable=True
+                self.module,
+                tensors,
+                training=True,
+                differentiable=True,
+                input_ids=self._ids(),
             )
         finally:
             self.module._indexer_projections = inner_proj
@@ -1285,13 +1557,19 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
     def test_warmup_scores_every_causal_column_via_tilelang(self):
         """Phase 2 scores the whole causal span, in one tilelang call.
 
-        Two things are pinned. First, the **cuDNN** top-k kernel -- phase 3's
+        Three things are pinned. First, the **cuDNN** top-k kernel -- phase 3's
         selector -- is called zero times: this phase reads no ``index_topk``, no
         window and no clamped candidate range. Second, the tilelang indexer is
         called exactly once at ``topk_effective == s``, its documented
-        "full-candidate selection" mode, and the columns it comes back with are
-        exactly the attention table's, diagonal included -- the very column the
-        old clamped candidate range could never return.
+        "full-candidate selection" mode. Third, the columns it comes back with
+        are exactly the per-document causal set, diagonal included -- the very
+        column the old clamped candidate range could never return.
+
+        The causal set is now only *analytic* (``_full_causal_table``): with the
+        dense backend there is no attention table to compare against, which is
+        itself asserted -- ``_CAPTURED`` stays empty while the KL still spans
+        every causal column, i.e. the width came without the ``[b, s, s]``
+        transient.
 
         Before the phase split this test demanded one *cuDNN* call for a widened
         loss table. That widening was the bug: at the production
@@ -1317,13 +1595,16 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
             tl_columns.append(columns.numpy().copy())
             return columns, probs
 
-        query, key, w_v, x, qr = self._inputs()
-        tensors = [t.clone() for t in (query, key, x, qr)]
+        tensors = [t.clone() for t in self._inputs()]
         fwd_mod.cudnn_indexer_topk_fwd = recording_cudnn
         tl_mod.csa_indexer_topk_fwd = recording_tl
         try:
             out = self._call(
-                self.module, tensors, w_v, training=True, differentiable=True
+                self.module,
+                tensors,
+                training=True,
+                differentiable=True,
+                input_ids=self._ids(),
             )
             out.cast("float32").sum().backward()
         finally:
@@ -1335,32 +1616,36 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
         )
         self.assertEqual(tl_widths, [self.SEQLEN])
         self.assertIn("values", DSAIndexerLossLoggingHelper.tracker)
+        self.assertEqual(_CAPTURED, [], "the block-sparse kernel was reached")
 
-        attn_table = _CAPTURED[-1]
-        np.testing.assert_array_equal(
-            attn_table, _full_causal_table(self.LAYOUT, self.SEQLEN)
-        )
+        causal = _full_causal_table(self.LAYOUT, self.SEQLEN)
         kl_columns = tl_columns[0]
         for row in range(self.SEQLEN):
-            attn_cols = attn_table[0, row]
+            causal_cols = causal[0, row]
             kl_cols = kl_columns[0, row]
             self.assertEqual(
                 set(kl_cols[kl_cols >= 0].tolist()),
-                set(attn_cols[attn_cols >= 0].tolist()),
-                f"row {row}: KL and attention column sets differ",
+                set(causal_cols[causal_cols >= 0].tolist()),
+                f"row {row}: KL and causal column sets differ",
             )
         last = self.SEQLEN - 1
-        self.assertIn(last, set(attn_table[0, last].tolist()))
         self.assertIn(last, set(kl_columns[0, last].tolist()))
+        # The KL target is built over that same width, once.
+        self.assertEqual(
+            [t.shape for t in _WARMUP_TARGETS],
+            [(1, self.SEQLEN, self.SEQLEN)],
+        )
 
     def test_eval_early_exit_matches_the_training_forward(self):
-        """``:495`` skips the indexer projections entirely under ``eval()``.
+        """The no-loss forward skips the indexer entirely.
 
-        Attention does not consume the indexer in this phase, so with nothing to
-        learn this step there is nothing to compute -- and the attention output
-        must be bit-identical to the training forward, which does run them.
+        ``_needs_indexer_loss`` gates the whole second half
+        (``mha_dsa_warmup_attention.py:199-200``), so with nothing to learn this
+        step there is nothing to compute -- and because the attention half is
+        the same ``super().forward`` either way, the output must be
+        bit-identical to the training forward, which does run the indexer.
         """
-        query, key, w_v, x, qr = self._inputs(seed=2)
+        tensors = self._inputs(seed=2)
         calls = []
         inner = self.module.indexer.forward_before_topk
 
@@ -1370,48 +1655,65 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
 
         self.module.indexer.forward_before_topk = recording
 
-        tensors = [t.clone() for t in (query, key, x, qr)]
         out_train = _fp32(
             self._call(
-                self.module, tensors, w_v, training=True, differentiable=True
+                self.module,
+                [t.clone() for t in tensors],
+                training=True,
+                differentiable=True,
+                input_ids=self._ids(),
             )
         )
         self.assertEqual(len(calls), 1)
         self.assertIn("values", DSAIndexerLossLoggingHelper.tracker)
+        self.assertEqual(len(_WARMUP_TARGETS), 1)
 
         DSAIndexerLossLoggingHelper.tracker.clear()
         out_eval = _fp32(
-            self._call(self.module, (query, key, x, qr), w_v, training=False)
+            self._call(
+                self.module, tensors, training=False, input_ids=self._ids()
+            )
         )
         self.assertEqual(len(calls), 1, "eval must not run the indexer at all")
+        self.assertEqual(len(_WARMUP_TARGETS), 1, "eval built a KL target")
         self.assertNotIn("values", DSAIndexerLossLoggingHelper.tracker)
         np.testing.assert_array_equal(out_train, out_eval)
 
     def test_indexer_gradients_flow_in_the_warmup_phase(self):
-        """All five indexer parameters keep a finite non-zero gradient.
+        """Every indexer parameter keeps a finite non-zero gradient.
 
         Phase 2 is where the indexer does all of its learning (the backbone is
         frozen by the trainer), so a silently gradient-free indexer parameter
         would waste the entire phase. Same contract as
         ``TestMQADSA.test_backward_produces_finite_grads_and_reports_loss``,
-        extended to ``k_norm`` and driven with attention detached from the
-        indexer's output.
+        widened to the whole parameter set and driven through the dense backend,
+        whose attention half does not touch the indexer at all -- the gradients
+        can only come from the KL attached to the output
+        (``mha_dsa_warmup_attention.py:342-354``). Measured range on this
+        fixture: 9.3e-8 .. 2.2e-7 over the 8 parameters.
         """
-        query, key, w_v, x, qr = self._inputs()
-        tensors = [query, key, x, qr]
+        tensors = self._inputs()
+        query, x, qr = tensors[0], tensors[3], tensors[4]
         out = self._call(
-            self.module, tensors, w_v, training=True, differentiable=True
+            self.module,
+            tensors,
+            training=True,
+            differentiable=True,
+            input_ids=self._ids(),
         )
         out.cast("float32").sum().backward()
         indexer = self.module.indexer
-        params = {
-            "wq_b.weight": indexer.wq_b.linear.weight,
-            "wk.weight": indexer.wk.linear.weight,
-            "k_norm.weight": indexer.k_norm.weight,
-            "k_norm.bias": indexer.k_norm.bias,
-            "weights_proj.weight": indexer.weights_proj.linear.weight,
-        }
-        for name, param in params.items():
+        # Every parameter, not a hand-listed subset: the measured set is 8
+        # (weight+bias of wq_b / wk / k_norm / weights_proj), and a new one
+        # appearing gradient-free would otherwise go unnoticed.
+        named = dict(indexer.named_parameters())
+        self.assertGreaterEqual(len(named), 5)
+        for expected in ("wq_b", "wk", "k_norm", "weights_proj"):
+            self.assertTrue(
+                any(expected in name for name in named),
+                f"indexer has no {expected} parameter any more",
+            )
+        for name, param in named.items():
             self.assertIsNotNone(param.grad, f"indexer.{name} has no gradient")
             self.assertTrue(
                 bool(paddle.isfinite(param.grad.cast("float32")).all()),
@@ -1430,37 +1732,50 @@ class TestMQADSAWarmupPhase(unittest.TestCase):
         self.assertTrue(bool(paddle.isfinite(query.grad.cast("float32")).all()))
         self.assertIn("values", DSAIndexerLossLoggingHelper.tracker)
 
-    def test_recompute_double_forward_table_is_bit_identical(self):
-        """Stronger than the phase-3 equivalent, and on the harder layout.
+    def test_recompute_double_forward_attaches_the_loss_once(self):
+        """Reentrant recompute runs the layer twice: pass 1 under ``no_grad``.
 
-        ``TestMQADSA.test_recompute_double_forward_is_consistent`` has to pick a
-        two-document layout because the top-k kernel's emitted order drifts on a
-        single full-length document. Phase 2's table contains no floating-point
-        scoring at all, so it is bit-identical across the two passes *and* equal
-        to the analytic table -- assert both, on the single-document layout that
-        the phase-3 path cannot use.
+        The loss must be attached on the grad-enabled pass only -- otherwise it
+        would be counted twice -- and, since the attention half is dense
+        flashmask on a fixed mask, the two passes must produce the same output
+        bit for bit. The old form of this test asserted the same thing about the
+        index table; there is none any more, so the KL target takes its place:
+        it is built once, on the differentiable pass.
+
+        Single document on purpose: the phase-3 equivalent
+        (``TestMQADSA.test_recompute_double_forward_is_consistent``) has to
+        avoid that layout because the top-k kernel's emitted order drifts on it.
+        Phase 2 has no top-k, so the hard layout is available.
         """
-        seqlen = self.SEQLEN
-        self.row_end = _row_end([seqlen], seqlen)
-        query, key, w_v, x, qr = self._inputs()
-        query.stop_gradient = False
-        expected = _full_causal_table([seqlen], seqlen)
+        self.row_end = _row_end([self.SEQLEN], self.SEQLEN)
+        tensors = self._inputs()
+        tensors[0].stop_gradient = False
 
-        _CAPTURED.clear()
         with paddle.no_grad():
-            self._call(self.module, (query, key, x, qr), w_v, training=True)
-        first = _CAPTURED[-1]
+            first = _fp32(
+                self._call(
+                    self.module,
+                    tensors,
+                    training=True,
+                    input_ids=self._ids(),
+                )
+            )
+        self.assertEqual(_WARMUP_TARGETS, [])
         self.assertNotIn(
             "values",
             DSAIndexerLossLoggingHelper.tracker,
             "indexer loss must not be attached on the no_grad pass",
         )
 
-        self._call(self.module, (query, key, x, qr), w_v, training=True)
-        second = _CAPTURED[-1]
+        second = _fp32(
+            self._call(
+                self.module, tensors, training=True, input_ids=self._ids()
+            )
+        )
         np.testing.assert_array_equal(first, second)
-        np.testing.assert_array_equal(first, expected)
+        self.assertEqual(len(_WARMUP_TARGETS), 1)
         self.assertIn("values", DSAIndexerLossLoggingHelper.tracker)
+        self.assertEqual(_CAPTURED, [], "the block-sparse kernel was reached")
 
 
 class TestHashableTensor(unittest.TestCase):
@@ -1680,7 +1995,10 @@ class TestAttnTargetDispatch(unittest.TestCase):
     def test_lse_absent_selects_the_reference(self):
         got = MQALatentAttention._attn_target(self.stub, "q", "kv", "idx", None)
         self.assertEqual((got, self.calls), ("python", ["python"]))
-        # The default is the fallback too: phase 2 calls it with three args.
+        # The default is the fallback too. No production caller omits the LSE
+        # any more (phase 2 used to), but the parameter's default is what makes
+        # the reference reachable from a bare three-argument call, which is how
+        # every reference-vs-kernel comparison in this file invokes it.
         self.assertEqual(
             MQALatentAttention._attn_target(self.stub, "q", "kv", "idx"),
             "python",

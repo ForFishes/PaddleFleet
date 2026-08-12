@@ -14,6 +14,7 @@
 
 import unittest
 from functools import wraps
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -97,6 +98,7 @@ from paddlefleet.transformer.dsv4_hybrid_attention import (
     build_document_rope_freqs,
 )
 from paddlefleet.transformer.enums import AttnMaskType
+from paddlefleet.transformer.hybrid_mla_indexer import latent_mqa_enabled
 from paddlefleet.transformer.mqa_latent_attention import (
     MQALatentAttention,
 )
@@ -3166,42 +3168,75 @@ class TestGroupedMatmulLayoutGuard(unittest.TestCase):
 
 
 class TestHybridMLAAttentionSinkParameter(unittest.TestCase):
-    """``add_full_attention_sink_bias`` must give the same parameter in both
-    hybrid MLA phases.
+    """``add_full_attention_sink_bias`` must give the same parameter in all
+    three hybrid MLA phases.
 
     The sink is created by ``build_softmax_offset`` *on the core attention*, so
-    its state_dict name is ``core_attention.softmax_offset`` for the dense MHA
-    phase (``hybrid_mla_attention="mha"``, where ``DotProductAttention`` consumes
-    it as the FA4 ``learnable_sink``) as well as for the latent MQA + DSA
-    indexer phase (``hybrid_mla_attention="mqa_dsa"``, where
-    ``MQALatentAttention`` feeds it to the block-sparse kernel). Keeping one
-    name, one shape and one dtype is what lets an MHA checkpoint load into a
-    latent-MQA run unchanged.
+    its state_dict name is ``core_attention.softmax_offset`` for all of them:
+    phase 1 dense MHA (``"mha"`` -> ``DotProductAttention``, which consumes it as
+    the FA4 ``learnable_sink``), phase 2 DSA warmup (``"mqa_dsa"`` +
+    ``dsa_indexer_use_sparse_loss=False`` -> ``MHADSAWarmupAttention``, i.e. the
+    same dense consumer plus an indexer) and phase 3 (``"mqa_dsa"`` +
+    ``dsa_indexer_use_sparse_loss=True`` -> ``MQALatentAttention``, which feeds
+    it to the block-sparse kernel). Keeping one name, one shape and one dtype is
+    what lets an MHA checkpoint load into a latent-MQA run unchanged.
+
+    WAS: two phases, ``_PHASES = ("mha", "mqa_dsa")``, and the dense-only FA4 /
+    bf16 construction guards were asserted to NOT apply to ``"mqa_dsa"``. NO
+    LONGER TRUE for phase 2: it is dense now, so it inherits both guards on
+    purpose ("phase 2 runs wherever phase 1 runs"). The guards are pinned on the
+    latent phase (``sparse_loss=True``) instead, and phase 2 is asserted to be
+    gated exactly like phase 1.
     """
 
-    def _build(self, hybrid_mla_attention, sink):
+    # (hybrid_mla_attention, dsa_indexer_use_sparse_loss) per phase, in
+    # training order. ``"mqa_full_causal"`` (indexer-less latent MQA, equivalence
+    # experiments only) shares phase 3's sink layout and is not repeated here.
+    _MHA = ("mha", False)
+    _WARMUP = ("mqa_dsa", False)
+    _SPARSE = ("mqa_dsa", True)
+    _PHASES = (_MHA, _WARMUP, _SPARSE)
+
+    @staticmethod
+    def _is_latent(hybrid_mla_attention, sparse_loss):
+        """The production dispatch predicate, not a copy of its rule."""
+        return latent_mqa_enabled(
+            SimpleNamespace(
+                experimental_attention_variant="dsv4_hybrid",
+                hybrid_mla_attention=hybrid_mla_attention,
+                dsa_indexer_use_sparse_loss=sparse_loss,
+            )
+        )
+
+    def _build(self, hybrid_mla_attention, sparse_loss, sink):
         # ``MultiLatentAttention.__init__`` refuses to create the sink for the
-        # dense MHA phase unless ``FLAGS_flash_attn_version in (3, 4)``: that
-        # phase consumes it as ``flashmask_attention_func(learnable_sink=...)``,
-        # which only exists on the cute path. The image default is 2, so flip
-        # the flag for the construction and restore it -- these tests only
-        # inspect the parameter, and the process-global default must stay
-        # untouched for the other suites in this file. The absorbed phase owns
-        # its sink inside the block-sparse kernel and needs no flag.
-        needs_fa4 = sink and hybrid_mla_attention == "mha"
+        # dense phases unless ``FLAGS_flash_attn_version in (3, 4)``: they
+        # consume it as ``flashmask_attention_func(learnable_sink=...)``, which
+        # only exists on the cute path. The image default is 2, so flip the flag
+        # for the construction and restore it -- these tests only inspect the
+        # parameter, and the process-global default must stay untouched for the
+        # other suites in this file. The latent phase owns its sink inside the
+        # block-sparse kernel and needs no flag.
+        needs_fa4 = sink and not self._is_latent(
+            hybrid_mla_attention, sparse_loss
+        )
         previous = paddle.get_flags(["FLAGS_flash_attn_version"])[
             "FLAGS_flash_attn_version"
         ]
         if needs_fa4:
             paddle.set_flags({"FLAGS_flash_attn_version": 4})
         try:
-            return self._build_raw(hybrid_mla_attention, sink)
+            return self._build_raw(hybrid_mla_attention, sparse_loss, sink)
         finally:
             if needs_fa4:
                 paddle.set_flags({"FLAGS_flash_attn_version": previous})
 
     def _build_raw(
-        self, hybrid_mla_attention, sink, params_dtype=paddle.bfloat16
+        self,
+        hybrid_mla_attention,
+        sparse_loss,
+        sink,
+        params_dtype=paddle.bfloat16,
     ):
         """Build without touching ``FLAGS_flash_attn_version``."""
         model_parallel_cuda_manual_seed(_SEED)
@@ -3211,6 +3246,7 @@ class TestHybridMLAAttentionSinkParameter(unittest.TestCase):
             params_dtype=params_dtype,
             csa_compress_ratios=[-2, 128],
             hybrid_mla_attention=hybrid_mla_attention,
+            dsa_indexer_use_sparse_loss=sparse_loss,
             add_full_attention_sink_bias=sink,
             # The -2 layer's DSA indexer (built only for
             # hybrid_mla_attention="mqa_dsa") reads these model-wide fields; the
@@ -3241,29 +3277,40 @@ class TestHybridMLAAttentionSinkParameter(unittest.TestCase):
             if name.endswith("softmax_offset")
         )
 
-    # The two hybrid MLA phases: dense MHA (``"mha"``) and latent MQA + DSA
-    # indexer (``"mqa_dsa"``). The indexer-less latent MQA mode
-    # (``"mqa_full_causal"``) exists only for equivalence experiments and shares
-    # the ``"mqa_dsa"`` sink layout, so it is not a separate phase here.
-    _PHASES = ("mha", "mqa_dsa")
+    def test_core_attention_class_per_phase(self):
+        """The three phases really are three different core-attention classes.
+
+        Without this the rest of the class could pass while every phase built
+        the same module.
+        """
+        expected = {
+            self._MHA: "DotProductAttention",
+            self._WARMUP: "MHADSAWarmupAttention",
+            self._SPARSE: "MQALatentAttention",
+        }
+        for phase, core in expected.items():
+            with self.subTest(phase=phase):
+                mla = self._build(*phase, sink=True)
+                self.assertEqual(type(mla.core_attention).__name__, core)
+                self.assertIs(mla.mqa_latent, self._is_latent(*phase))
 
     def test_disabled_creates_no_parameter(self):
-        for hybrid_mla_attention in self._PHASES:
-            with self.subTest(hybrid_mla_attention=hybrid_mla_attention):
-                mla = self._build(hybrid_mla_attention, sink=False)
+        for phase in self._PHASES:
+            with self.subTest(phase=phase):
+                mla = self._build(*phase, sink=False)
                 self.assertIsNone(mla.core_attention.softmax_offset)
                 self.assertEqual(self._sink_keys(mla), [])
 
     def test_enabled_creates_one_zero_initialised_per_head_parameter(self):
-        for hybrid_mla_attention in self._PHASES:
-            with self.subTest(hybrid_mla_attention=hybrid_mla_attention):
-                mla = self._build(hybrid_mla_attention, sink=True)
+        for phase in self._PHASES:
+            with self.subTest(phase=phase):
+                mla = self._build(*phase, sink=True)
                 sink = mla.core_attention.softmax_offset
                 self.assertIsNotNone(sink)
                 # One logit per local head of the hybrid MLA layer.
                 self.assertEqual(list(sink.shape), [64])
-                # bf16 == params_dtype: the FA4 cute kernel of the dense MHA
-                # phase asserts learnable_sink.dtype == bfloat16.
+                # bf16 == params_dtype: the FA4 cute kernel of the dense phases
+                # asserts learnable_sink.dtype == bfloat16.
                 self.assertEqual(sink.dtype, paddle.bfloat16)
                 # The shared ``build_softmax_offset`` helper initialises the
                 # learnable sink with ``config.init_method`` (normal, std=0.02)
@@ -3278,67 +3325,77 @@ class TestHybridMLAAttentionSinkParameter(unittest.TestCase):
                 )
 
     def test_state_dict_name_is_identical_across_phases(self):
-        # The valuable "an MHA checkpoint stays loadable into a latent-MQA
-        # run" guarantee: same name, shape and dtype in both phases.
-        mha = self._build(hybrid_mla_attention="mha", sink=True)
-        mqa = self._build(hybrid_mla_attention="mqa_dsa", sink=True)
-        self.assertEqual(self._sink_keys(mha), self._sink_keys(mqa))
-        self.assertEqual(
-            mha.core_attention.softmax_offset.shape,
-            mqa.core_attention.softmax_offset.shape,
-        )
-        self.assertEqual(
-            mha.core_attention.softmax_offset.dtype,
-            mqa.core_attention.softmax_offset.dtype,
-        )
+        # The valuable "an MHA checkpoint stays loadable by the later phases"
+        # guarantee: same name, shape and dtype in all three.
+        seen = {}
+        for phase in self._PHASES:
+            mla = self._build(*phase, sink=True)
+            sink = mla.core_attention.softmax_offset
+            seen[phase] = (
+                tuple(self._sink_keys(mla)),
+                tuple(sink.shape),
+                str(sink.dtype),
+            )
+        self.assertEqual(len(set(seen.values())), 1, seen)
+        self.assertEqual(seen[self._MHA][0], ("core_attention.softmax_offset",))
 
-    def test_mha_sink_without_fa4_is_rejected_at_construction(self):
-        # The dense MHA phase reaches the sink only through the flashmask cute
+    def test_dense_sink_without_fa4_is_rejected_at_construction(self):
+        # The dense phases reach the sink only through the flashmask cute
         # kernel, which is gated on FLAGS_flash_attn_version in (3, 4). With the
         # image default of 2 the run used to die at the *first forward* on an
         # opaque ``learnable_sink is only supported on the flashmask v4 (cute)
         # path`` assertion; ``MultiLatentAttention.__init__`` now refuses up
-        # front.
+        # front. Phase 2 is dense, so it is gated exactly like phase 1 -- that
+        # inheritance is the point, not an oversight.
         previous = paddle.get_flags(["FLAGS_flash_attn_version"])[
             "FLAGS_flash_attn_version"
         ]
         paddle.set_flags({"FLAGS_flash_attn_version": 2})
         try:
-            with self.assertRaisesRegex(
-                RuntimeError, "FLAGS_flash_attn_version"
-            ):
-                self._build_raw(hybrid_mla_attention="mha", sink=True)
-            # The absorbed phase owns its sink inside the block-sparse kernel,
-            # so the flag must NOT gate it.
+            for phase in (self._MHA, self._WARMUP):
+                with (
+                    self.subTest(phase=phase),
+                    self.assertRaisesRegex(
+                        RuntimeError, "FLAGS_flash_attn_version"
+                    ),
+                ):
+                    self._build_raw(*phase, sink=True)
+            # The latent phase owns its sink inside the block-sparse kernel, so
+            # the flag must NOT gate it.
             self.assertIsNotNone(
                 self._build_raw(
-                    hybrid_mla_attention="mqa_dsa", sink=True
+                    *self._SPARSE, sink=True
                 ).core_attention.softmax_offset
             )
         finally:
             paddle.set_flags({"FLAGS_flash_attn_version": previous})
 
-    def test_mha_sink_with_non_bf16_params_dtype_is_rejected(self):
+    def test_dense_sink_with_non_bf16_params_dtype_is_rejected(self):
         # Second requirement of the same cute kernel: it asserts the learnable
         # sink is bf16, and the sink is created with ``params_dtype``. An fp32
         # run therefore used to pass construction and die on the first forward
         # with a terse ``learnable_sink must be bfloat16`` that names no config
-        # knob. The guard now names ``params_dtype`` at construction time.
+        # knob. The guard now names ``params_dtype`` at construction time, for
+        # both dense phases.
         previous = paddle.get_flags(["FLAGS_flash_attn_version"])[
             "FLAGS_flash_attn_version"
         ]
         paddle.set_flags({"FLAGS_flash_attn_version": 4})
         try:
-            with self.assertRaisesRegex(RuntimeError, "params_dtype"):
-                self._build_raw(
-                    hybrid_mla_attention="mha",
-                    sink=True,
-                    params_dtype=paddle.float32,
-                )
-            # The block-sparse kernel up-casts the sink itself, so the absorbed
+            for phase in (self._MHA, self._WARMUP):
+                with (
+                    self.subTest(phase=phase),
+                    self.assertRaisesRegex(RuntimeError, "params_dtype"),
+                ):
+                    self._build_raw(
+                        *phase,
+                        sink=True,
+                        params_dtype=paddle.float32,
+                    )
+            # The block-sparse kernel up-casts the sink itself, so the latent
             # phase must stay dtype agnostic.
             mqa = self._build_raw(
-                hybrid_mla_attention="mqa_dsa",
+                *self._SPARSE,
                 sink=True,
                 params_dtype=paddle.float32,
             )

@@ -41,11 +41,17 @@ import paddle.nn.functional as F
 from paddle.distributed.fleet.meta_parallel import LayerSpec
 
 from paddlefleet.transformer.csa_attention import _derive_csa_doc_boundaries
+from paddlefleet.transformer.dot_product_attention import DotProductAttention
 from paddlefleet.transformer.dsa_attention import (
     DSAIndexer,
     DSAIndexerSublayersSpec,
 )
 from paddlefleet.transformer.enums import AttnMaskType
+from paddlefleet.transformer.hybrid_mla_indexer import latent_mqa_enabled
+from paddlefleet.transformer.mha_dsa_warmup_attention import (
+    MHADSAWarmupAttention,
+    MHADSAWarmupAttentionSublayersSpec,
+)
 from paddlefleet.transformer.mqa_latent_attention import (
     MQALatentAttention,
     MQALatentAttentionSublayersSpec,
@@ -143,17 +149,26 @@ _HYBRID_MLA_ATTENTION = {
 }
 
 
-def _create_mqa_config(mode="mqa", loss_coeff=0.0, num_hidden_layers=2):
+def _create_mqa_config(
+    mode="mqa", loss_coeff=0.0, num_hidden_layers=2, sparse_loss=True
+):
     """dsv4_hybrid config for a ``csa_compress_ratios == -2`` layer.
 
     ``mode`` is a test-only fixture label mapped onto the production
     ``hybrid_mla_attention`` enum by ``_HYBRID_MLA_ATTENTION``: ``"mha"`` keeps
     the dense per-head path, ``"mqa"`` selects ``"mqa_full_causal"`` (latent MQA
     over the full per-document causal set, no indexer) and ``"mqa_dsa"`` selects
-    ``"mqa_dsa"`` (latent MQA + DSA indexer). Whether an indexer actually exists
-    is expressed by ``_build_module`` attaching one to the sublayers spec,
-    mirroring the production source which reads the layer path from the spec,
-    not from a config string.
+    ``"mqa_dsa"`` (DSA indexer). Whether an indexer actually exists is expressed
+    by ``_build_module`` attaching one to the sublayers spec, mirroring the
+    production source which reads the layer path from the spec, not from a
+    config string.
+
+    ``sparse_loss`` is ``dsa_indexer_use_sparse_loss``, i.e. the phase switch of
+    ``"mqa_dsa"``. It picks the *attention backend* as well as the loss width, so
+    ``_build_module`` dispatches on it through the production predicate
+    ``hybrid_mla_indexer.latent_mqa_enabled``: ``True`` (phase 3/4) builds latent
+    MQA, ``False`` (phase 2, DSA warmup) builds the dense per-head
+    ``MHADSAWarmupAttention``.
 
     Attributes are assigned after construction so that ``__post_init__``
     validation (exercised by the production model config, not by this unit) is
@@ -188,7 +203,7 @@ def _create_mqa_config(mode="mqa", loss_coeff=0.0, num_hidden_layers=2):
     config.dsa_index_topk = INDEX_TOPK
     config.csa_window_size = WINDOW
     config.dsa_indexer_loss_coeff = loss_coeff
-    config.dsa_indexer_use_sparse_loss = True
+    config.dsa_indexer_use_sparse_loss = sparse_loss
     config.dsa_indexer_rotary_interleaved = False
     # The -2 layers are uncompressed, hence plain RoPE (base 10000); YaRN only
     # applies to the compressed HCA layers.
@@ -222,6 +237,39 @@ class RecordingMQA(MQALatentAttention):
         )
 
 
+class RecordingWarmupMHA(MHADSAWarmupAttention):
+    """Phase-2 counterpart of :class:`RecordingMQA`.
+
+    There is no index table to capture: the whole point of the phase-2 backend
+    is that no ``[b, s, s]`` table and no block-sparse call exist. So the hook
+    records the KL target instead (into ``_WARMUP_TARGETS``), and ``_CAPTURED``
+    staying empty across a phase-2 forward *is* the assertion that the
+    block-sparse kernel was never reached.
+    """
+
+    def _dense_attn_target(self, *args, **kwargs):
+        target = super()._dense_attn_target(*args, **kwargs)
+        _WARMUP_TARGETS.append(target.astype("float32").numpy().copy())
+        return target
+
+
+_WARMUP_TARGETS = []
+
+
+def _indexer_layer_spec():
+    """``LayerSpec`` for the hybrid-MLA ``DSAIndexer``, shared by both phases."""
+    return LayerSpec(
+        layer=DSAIndexer,
+        sublayers_spec=DSAIndexerSublayersSpec(
+            linear_wq_b=BiasedLinear,
+            linear_wk=BiasedLinear,
+            k_norm=LayerNormStub,
+            linear_weights_proj=BiasedLinear,
+        ),
+        extra_kwargs={"is_hybrid_mla_indexer": True},
+    )
+
+
 def _build_module(
     config,
     layer_number=1,
@@ -230,7 +278,12 @@ def _build_module(
     is_mtp=False,
     pg_collection=None,
 ):
-    """Build a ``RecordingMQA``.
+    """Build the core attention this config selects.
+
+    ``RecordingWarmupMHA`` (dense per-head, phase 2) when the config has an
+    indexer but ``latent_mqa_enabled`` is False, ``RecordingMQA`` (latent MQA)
+    otherwise. The dispatch is the production predicate itself, so a fixture can
+    never build a backend the model would not.
 
     ``pg_collection`` must be passed explicitly by the context-parallel tests
     (``tests/multi_card_tests/transformer/test_mqa_dsa_cp.py``): left ``None``
@@ -238,43 +291,82 @@ def _build_module(
     which inside a ``fleet.init``-ed process would hand the CP=1 reference the
     real CP group.
     """
-    indexer = None
-    if getattr(config, "_build_dsa_indexer", False):
-        indexer = LayerSpec(
-            layer=DSAIndexer,
-            sublayers_spec=DSAIndexerSublayersSpec(
-                linear_wq_b=BiasedLinear,
-                linear_wk=BiasedLinear,
-                k_norm=LayerNormStub,
-                linear_weights_proj=BiasedLinear,
-            ),
-            extra_kwargs={"is_hybrid_mla_indexer": True},
+    has_indexer = bool(getattr(config, "_build_dsa_indexer", False))
+    indexer = _indexer_layer_spec() if has_indexer else None
+    common = {
+        "config": config,
+        "layer_number": layer_number,
+        "attn_mask_type": AttnMaskType.causal,
+        "attention_type": "self",
+        "k_channels": K_CHANNELS,
+        "is_mtp_layer": is_mtp,
+        "pg_collection": pg_collection,
+    }
+    if has_indexer and not latent_mqa_enabled(config):
+        module = RecordingWarmupMHA(
+            sublayers_spec=MHADSAWarmupAttentionSublayersSpec(indexer=indexer),
+            # ``MLASelfAttention`` passes these three to every core attention
+            # (multi_latent_attention.py:551-554); the latent-MQA class derives
+            # them from the config instead, which is why only this branch needs
+            # them.
+            v_channels=V_HEAD_DIM,
+            num_attention_heads=H,
+            num_key_value_heads=1,
+            **common,
         )
-    module = RecordingMQA(
-        config=config,
-        sublayers_spec=MQALatentAttentionSublayersSpec(indexer=indexer),
-        layer_number=layer_number,
-        attn_mask_type=AttnMaskType.causal,
-        attention_type="self",
-        k_channels=K_CHANNELS,
-        is_mtp_layer=is_mtp,
-        pg_collection=pg_collection,
-    )
+    else:
+        module = RecordingMQA(
+            sublayers_spec=MQALatentAttentionSublayersSpec(indexer=indexer),
+            **common,
+        )
     if bf16:
         # ``rotate_activation`` asserts bf16 inputs, so the indexer projections
         # must hold bf16 weights.
         module.to(dtype="bfloat16")
     if sink is not None:
-        # In production ``MQALatentAttention.__init__`` builds this parameter
-        # via the shared ``build_softmax_offset`` helper (name
-        # ``core_attention.softmax_offset``, identical to the dense
-        # ``DotProductAttention`` phase, so an MHA checkpoint stays loadable).
-        # This unit uses a default config with no sink configured, so the
-        # helper returns ``None``; inject the sink here instead. Created *after*
-        # ``to(dtype=...)`` and in the module dtype: production uses
-        # ``params_dtype`` (bf16), which is what the FA4 cute kernel of the
-        # dense path requires, and the DSA path returns the sink gradient in
-        # the parameter's own dtype.
+        # In production both core attentions build this parameter via the shared
+        # ``build_softmax_offset`` helper (name ``core_attention.softmax_offset``
+        # in every phase, so an MHA checkpoint stays loadable). This unit uses a
+        # default config with no sink configured, so the helper returns ``None``;
+        # inject the sink here instead. Created *after* ``to(dtype=...)`` and in
+        # the module dtype: production uses ``params_dtype`` (bf16), which is
+        # what the FA4 cute kernel of the dense path requires, and the DSA path
+        # returns the sink gradient in the parameter's own dtype.
+        module.softmax_offset = module.create_parameter(
+            shape=[H],
+            dtype="bfloat16" if bf16 else "float32",
+            default_initializer=paddle.nn.initializer.Assign(
+                np.asarray(sink, dtype="float32")
+            ),
+        )
+    return module
+
+
+def _build_phase1_dense_module(
+    config, layer_number=1, bf16=False, sink=None, is_mtp=False
+):
+    """A plain :class:`DotProductAttention`, i.e. the phase-1 attention.
+
+    The reference the phase-2 backend is asserted *bit-identical* to: phase 2
+    delegates its whole attention half to ``super().forward``, so anything but
+    bit equality here means the warmup phase is no longer "phase 1 plus an
+    indexer loss". Built with exactly the kwargs ``MLASelfAttention`` passes
+    (multi_latent_attention.py:542-557).
+    """
+    module = DotProductAttention(
+        config=config,
+        layer_number=layer_number,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        is_mtp_layer=is_mtp,
+        k_channels=K_CHANNELS,
+        v_channels=V_HEAD_DIM,
+        num_attention_heads=H,
+        num_key_value_heads=1,
+    )
+    if bf16:
+        module.to(dtype="bfloat16")
+    if sink is not None:
         module.softmax_offset = module.create_parameter(
             shape=[H],
             dtype="bfloat16" if bf16 else "float32",
@@ -326,6 +418,60 @@ def _rel(actual, expected):
     a = actual.cast("float32")
     e = expected.cast("float32")
     return float((a - e).norm() / e.norm().clip(min=1e-12))
+
+
+def _make_dense_inputs(seqlen, seed=0):
+    """``(query, key, value, x, qr)`` in the **per-head** phase-1/2 layout.
+
+    ``_make_inputs`` above produces the absorbed latent layout (one 576-wide
+    key head plus the de-absorption weight), which the dense backend cannot
+    consume: ``kv_b_proj`` has already materialised per-head K/V by the time it
+    is called, so it sees ``[b, s, H, K_CHANNELS]`` queries and keys and a
+    ``[b, s, H, V_HEAD_DIM]`` value. ``x`` / ``qr`` are the indexer's inputs and
+    are identical in both layouts.
+    """
+    paddle.seed(seed)
+    query = (paddle.randn([1, seqlen, H, K_CHANNELS]) * 0.5).cast("bfloat16")
+    key = (paddle.randn([1, seqlen, H, K_CHANNELS]) * 0.5).cast("bfloat16")
+    value = (paddle.randn([1, seqlen, H, V_HEAD_DIM]) * 0.5).cast("bfloat16")
+    x = (paddle.randn([1, seqlen, HIDDEN]) * 0.5).cast("bfloat16")
+    qr = (paddle.randn([1, seqlen, Q_LORA]) * 0.5).cast("bfloat16")
+    return query, key, value, x, qr
+
+
+def _dense_mha_reference(query, key, value, row_end, scale, sink=None):
+    """fp32 per-document causal MHA over the per-head layout.
+
+    The dense counterpart of ``_dense_reference``: same masking and same sink
+    semantics (one value-less softmax column per head), but on real per-head K/V
+    instead of the shared latent. Returns ``[1, s, H * V_HEAD_DIM]``.
+    """
+    seqlen = int(query.shape[1])
+    doc_start, is_valid = _doc_meta(row_end, seqlen)
+    pos = np.arange(seqlen)
+    allowed = (
+        (pos[None, :] <= pos[:, None])
+        & (pos[None, :] >= doc_start[:, None])
+        & is_valid[:, None]
+    )
+    q = query[0].cast("float32")
+    k = key[0].cast("float32")
+    v = value[0].cast("float32")
+    scores = paddle.einsum("shd,thd->sht", q, k) * scale
+    keep = paddle.to_tensor(allowed).unsqueeze(1)
+    scores = paddle.where(keep, scores, paddle.full_like(scores, -1e30))
+    if sink is None:
+        probs = F.softmax(scores, axis=-1)
+    else:
+        sink_col = paddle.to_tensor(np.asarray(sink, dtype="float32")).reshape(
+            [1, H, 1]
+        )
+        sink_col = paddle.expand(sink_col, [seqlen, H, 1])
+        probs = F.softmax(paddle.concat([scores, sink_col], axis=-1), axis=-1)
+        probs = probs[:, :, :seqlen]
+    out = paddle.einsum("sht,thv->shv", probs, v)
+    row_ok = paddle.to_tensor(is_valid).cast("float32").reshape([seqlen, 1, 1])
+    return (out * row_ok).reshape([1, seqlen, H * V_HEAD_DIM])
 
 
 def _dense_reference(query, key, w_v, row_end, scale, sink=None):
