@@ -42,7 +42,7 @@ That moves, but does not remove, the CP evidence this file owes:
    sequence and row-sliced (``hybrid_mla_indexer._indexer_valid_range``).
 3. The full-candidate KL still has to normalise across the CP group: the masked
    branch divides by the **global** valid-row count
-   (``hybrid_mla_indexer.py:215-220``) and the unmasked one folds ``/cp_size``
+   (``hybrid_mla_indexer.py:222-227``) and the unmasked one folds ``/cp_size``
    into the coefficient handed to the *backward*
    (``mha_dsa_warmup_attention.py:322-326``).
 4. A layout with genuine row-validity pad rows. ``_STRADDLE`` sums to exactly
@@ -222,7 +222,7 @@ def _warmup_cfg(cp_size, loss_coeff=0.0):
     cfg.cp_balance_mode = "contiguous_allgather"
     # Production EB dataflow hands every rank the *global* ``input_ids``, which
     # is the branch ``_indexer_loss_mask`` takes when this flag is set
-    # (``hybrid_mla_indexer.py:210-214``).
+    # (``hybrid_mla_indexer.py:217-221``).
     cfg.experimental_dataflow = True
     cfg.pad_token_id = 0
     cfg.context_parallel_size = cp_size
@@ -730,7 +730,7 @@ class TestWarmupCP(_CPChecks):
 
         Read straight out of ``DSAIndexerLossLoggingHelper``, so it observes the
         denominator rather than its shadow in the gradients. Masked divides by
-        the **global** valid-row count (``hybrid_mla_indexer.py:215-220``);
+        the **global** valid-row count (``hybrid_mla_indexer.py:222-227``);
         unmasked takes the plain local mean with ``/cp_size`` folded into the
         coefficient, which ``_assert_loss_coeff`` checks reaches the backward.
         """

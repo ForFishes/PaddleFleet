@@ -200,13 +200,20 @@ class HybridMLAIndexerMixin:
         **global** valid-row count, so summing the per-rank losses reproduces the
         single-rank reduction. ``input_ids`` arrives sharded unless
         ``experimental_dataflow``, exactly as at ``csa_attention.py:2419-2428``.
+
+        An unset ``pad_token_id`` falls back to ``0``, the convention every other
+        consumer of it in this repository already follows
+        (``gpt_embedding.py:214-216``, ``mtp_embedding_layer.py:105-107``,
+        ``moe_router.py:605-607`` and four more sites): ``from_config`` can copy a
+        ``None`` straight out of an external/HF config, and treating that as a
+        fatal configuration error here would abort the first indexer loss of a
+        run that the embedding and the router accepted.
         """
         if input_ids is None:
             return None, None
         pad_token_id = getattr(self.config, "pad_token_id", 0)
-        assert pad_token_id is not None, (
-            "pad_token_id must be set in config when input_ids is provided"
-        )
+        if pad_token_id is None:
+            pad_token_id = 0
         if self.cp_enabled:
             if not getattr(self.config, "experimental_dataflow", False):
                 input_ids = ContextParallelGatherOp.apply(

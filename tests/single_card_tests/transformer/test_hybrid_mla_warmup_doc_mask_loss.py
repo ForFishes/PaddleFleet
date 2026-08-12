@@ -1164,11 +1164,52 @@ class TestWarmupIndexerLossPrecision(unittest.TestCase):
         # unscaled. The ``/cp_size`` branch is a multi-card concern.
         self.assertEqual(cap["coeff"], module.indexer_loss_coeff)
 
+    def test_unset_pad_token_id_falls_back_to_zero(self):
+        """``pad_token_id=None`` masks the same rows as ``0``; it is not fatal.
+
+        ``TransformerConfig.from_config`` can copy a ``None`` straight out of an
+        external/HF config, and every other consumer of the field in this
+        repository folds it to ``0`` (``gpt_embedding.py:214-216``,
+        ``mtp_embedding_layer.py:105-107``, ``moe_router.py:605-607`` and four
+        more sites). The earlier revision of ``_indexer_loss_mask`` asserted
+        ``is not None`` instead, which aborted such a run at its *first* indexer
+        loss -- and under ``python -O``, where asserts are stripped, would have
+        compared the ids against ``None`` and masked nothing. Flagged in the
+        upstream review of PR #1721; this pins the fallback.
+        """
+        seqlen, real_tokens = 256, 200
+        ids = np.zeros([1, seqlen], dtype="int64")
+        ids[0, :real_tokens] = np.arange(1, real_tokens + 1)
+        ids_t = paddle.to_tensor(ids)
+
+        module = _warmup_module()
+        module.config.pad_token_id = None
+        mask_none, rows_none = module._indexer_loss_mask(ids_t, 1, seqlen)
+
+        reference = _warmup_module()
+        self.assertEqual(reference.config.pad_token_id, 0)
+        mask_zero, rows_zero = reference._indexer_loss_mask(ids_t, 1, seqlen)
+
+        self.assertEqual(rows_none, float(real_tokens))
+        self.assertEqual(rows_none, rows_zero)
+        np.testing.assert_array_equal(mask_none.numpy(), mask_zero.numpy())
+
+        # And the whole loss path, not just the helper: the fallback has to reach
+        # both the KL sum and the denominator the backward divides by.
+        logged, cap = self._step(module, seqlen, [seqlen], input_ids=ids_t)
+        self.assertEqual(float(cap["mask"].sum()), float(real_tokens))
+        self.assertEqual(cap["num_rows"], float(real_tokens))
+        kl_per_row = self._kl_per_row(cap)
+        ref = float(
+            (kl_per_row * cap["mask"]).sum() / real_tokens * cap["coeff"]
+        )
+        self.assertLess(abs(logged - ref) / abs(ref), 1e-5)
+
     def test_no_input_ids_uses_the_plain_row_mean(self):
         """Without ``input_ids`` the reduction is ``kl.mean() * coeff``.
 
         ``_indexer_loss_mask`` returns ``(None, None)``
-        (``hybrid_mla_indexer.py:203-205``) and ``_attach_indexer_loss`` passes
+        (``hybrid_mla_indexer.py:212-213``) and ``_attach_indexer_loss`` passes
         that straight down, which is the same unmasked branch
         ``csa_attention._compute_fused_indexer_target`` takes: the backward then
         falls back to the kernel's own ``1/(B*Sq)``, and only the *logged* scalar
