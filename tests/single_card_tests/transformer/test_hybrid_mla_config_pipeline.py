@@ -999,6 +999,22 @@ class TestConfigDeltas(unittest.TestCase):
         # ``dsa_indexer_rope_fusion`` (``dsa_attention.py:458-461``).
         if name != _DSA:
             allowed["apply_rope_fusion"] = (True, False)
+        else:
+            # Phase 2's memory/compute picture *is* phase 1's now that its ``-2``
+            # layers run the same dense attention (``MHADSAWarmupAttention``
+            # subclasses ``DotProductAttention``), so the more conservative
+            # full/uniform recompute and GA=1 this yaml forked with have no
+            # reason left to exist and it was resynced to the baseline. The keys
+            # stay in ``_YAML_COMMON_DELTA`` for the three latent-MQA variants,
+            # whose picture really is different.
+            for key in (
+                "recompute_granularity",
+                "recompute_method",
+                "recompute_num_layers",
+                "recompute_modules",
+                "gradient_accumulation_steps",
+            ):
+                allowed.pop(key)
         if name in _MQA_DSA_CFGS:
             # ``indexer_init_from_scratch`` is mandatory once an indexer exists
             # (``modeling.py`` hard-errors on ``None``), so both mqa_dsa phases
