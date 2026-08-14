@@ -961,10 +961,7 @@ def _doc_fields(row_end, seqlen):
         _derive_csa_doc_boundaries,
     )
 
-    doc_start, doc_len, is_valid, doc_lens, _ = _derive_csa_doc_boundaries(
-        row_end, seqlen
-    )
-    return doc_start, doc_len, is_valid, doc_lens
+    return _derive_csa_doc_boundaries(row_end, seqlen)
 
 
 def _stub_indexer_loss_leaves(module):
@@ -1002,11 +999,11 @@ class TestMQAWarmupMetaLookup(unittest.TestCase):
         # ``_forward_full_causal`` (whose kernel path is GPU-gated), keep the
         # indexer-range split and the KL machinery real.
         module._forward_full_causal = lambda *a, **k: paddle.zeros([1, 4, 1])
-        module._check_tilelang_indexer_support = lambda: None
+        module._check_tilelang_indexer_support = lambda *a, **k: None
         _stub_indexer_loss_leaves(module)
         query, kv, x, qr, wv = _meta_index_inputs()
         row_end = _row_end([4], 4)
-        doc_start, doc_len, is_valid, _ = _doc_fields(row_end, 4)
+        doc_start, doc_len, is_valid, _, doc_starts = _doc_fields(row_end, 4)
         with (
             unittest.mock.patch(
                 "paddlefleet.tilelang_ops.csa_indexer_topk_fwd",
@@ -1027,6 +1024,7 @@ class TestMQAWarmupMetaLookup(unittest.TestCase):
                 doc_start,
                 doc_len,
                 is_valid,
+                doc_starts,
                 32,  # kv_lora_rank
                 None,  # input_ids
                 0,  # position_offset
@@ -1058,7 +1056,7 @@ class TestMQASparseMetaLookup(unittest.TestCase):
         _stub_indexer_loss_leaves(module)
         query, kv, x, qr, wv = _meta_index_inputs()
         row_end = _row_end([4], 4)
-        doc_start, doc_len, is_valid, doc_lens = _doc_fields(row_end, 4)
+        doc_start, doc_len, is_valid, doc_lens, _ = _doc_fields(row_end, 4)
         with (
             unittest.mock.patch(
                 "paddlefleet.cudnn_ops.indexer.csa_indexer_fwd_cudnn."

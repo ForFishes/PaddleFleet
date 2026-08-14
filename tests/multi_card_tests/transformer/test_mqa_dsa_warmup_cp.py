@@ -48,6 +48,13 @@ Three gaps in ``test_mqa_dsa_cp.py`` / ``test_mla_cp_contiguous_allgather.py``:
    space. Neither error raises, so ``TestDenseFA4CP`` carries the control that
    proves the checks can see an un-localised bound.
 
+4. The **dense cuDNN** KL backend (``csa_indexer_backend="cudnn"``), which
+   replaces tilelang's ``[s_local, s_global]`` index table with a THD descriptor
+   over the same candidate set. Localising a table is a row slice; localising THD
+   means ``cu_seqlens_k`` over the gathered keys, ``cu_seqlens_q`` over the local
+   rows and a per-row ``q_causal_offsets`` left border, none of which raises when
+   it is wrong. ``TestWarmupKLBackendsCP`` carries that claim.
+
 Everything reuses ``test_mqa_dsa_cp``'s harness (fleet init, CP globals -- which
 includes its module-level ``FLAGS_flash_attn_version=4`` pin --, ``run_core_cp``,
 ``_check``, ``_check_index_sets``). No ``if rank == X`` short-circuit exists in
@@ -630,6 +637,185 @@ class TestDenseFA4CP(_CPChecks):
             f"ones (good={good['fwd']:.3e} bad={bad['fwd']:.3e}), so this "
             "file's forward equivalence cannot see a CP mask bug",
         )
+
+
+class TestWarmupKLBackendsCP(_CPChecks):
+    """``csa_indexer_backend="cudnn"``: the dense KL triple under CP.
+
+    The single-card suite (``test_hybrid_mla_warmup_kl_cudnn.py``) pins the dense
+    cuDNN KL against tilelang and against an fp32 autograd reference. What it
+    cannot reach is the part of the dense path that only exists under CP: the
+    tilelang branch expresses the candidate set as an ``[s_local, s_global]``
+    index table, while the dense branch expresses it in THD --
+    ``dense_kl_cu_seqlens(segment_lens, position_offset, s_local)`` builds
+    ``cu_seqlens_k`` over the *globally gathered* keys, ``cu_seqlens_q`` over this
+    rank's rows, and ``q_causal_offsets`` carries each visible document's left
+    border. Getting that wrong does not raise: it silently admits a neighbouring
+    document, or this document's non-local prefix, into the KL's support.
+
+    So the claims are the ones a wrong border would break, in order of how
+    directly they see it:
+
+    * the CP=N-vs-CP=1 contract of ``run_core_cp`` on the cuDNN backend
+      (``_check``: forward plus every gradient, the indexer parameters included);
+    * the logged KL summing across the group to the CP=1 value
+      (``_assert_loss_cp_sum``) -- a per-rank denominator is off by ``cp_size``;
+    * the two backends agreeing on that CP-summed scalar, which is what makes
+      this a *dense-THD-under-CP* claim rather than a self-consistency one: both
+      backends would have to mis-slice identically to pass.
+
+    ``hybrid_mla_utils.INDEX_HEADS == 64`` is what lets both backends run this
+    fixture at all; ``_check_cudnn_dense_indexer_support`` rejects narrower
+    geometries from the forward.
+    """
+
+    # Both backends reduce a bf16-fed fp32 KL over the same candidate set, but
+    # in different orders (tilelang: per-row over a column table; dense: chunked
+    # over the raw score matrix), and the CP sum adds ``cp_size`` partial sums on
+    # top. Measured 1.5e-8..1.4e-7 for a backend against its own CP=1 value and
+    # ~1e-4 between backends, so this is three orders off a wrong denominator.
+    BACKEND_RTOL = 5e-3
+
+    # ``dense_indexer_backward_wrapper`` reduces ``d_index_k`` through fp32
+    # atomics, so the two parameters downstream of ``index_k`` -- ``wk`` and
+    # ``k_norm`` -- are not reproducible run to run, and at this fixture's ~9e-3
+    # nat KL the ``predict - target`` cancellation amplifies that into a large
+    # *relative* number on a ~1e-6-norm gradient. Measured single-card,
+    # single-process floor (same module, same leaves, four backwards): cuDNN
+    # 2.9e-2 (single doc) / 6.5e-2 (pad rows) against tilelang's 1.1e-3, with
+    # ``wq_b`` / ``weights_proj`` bitwise identical on both. ``GRAD_RTOL = 2e-2``
+    # therefore measures the atomics rather than CP, so give these two a bound
+    # above the floor and keep the strict one everywhere else. What CP failures
+    # look like by comparison: a wrong loss denominator is 100% at CP=2, and a
+    # mislocalised THD border moves the loss sum itself, which
+    # ``_assert_loss_cp_sum`` pins to 6e-8.
+    DK_GRAD_RTOL = 2e-1
+    _DK_PARAMS = ("indexer.wk.", "indexer.k_norm.")
+
+    def _check(self, res, tag):
+        """Harness ``_check``, with the two dK-atomic parameters split off."""
+        noisy = {
+            name: err
+            for name, err in res["param_err"].items()
+            if name.startswith(self._DK_PARAMS)
+        }
+        strict = {
+            name: err
+            for name, err in res["param_err"].items()
+            if name not in noisy
+        }
+        H.TestMQADSACP._check(self, dict(res, param_err=strict), tag)
+        for name, err in noisy.items():
+            self.assertIsNotNone(
+                err, f"{tag}: reference has no grad for {name}"
+            )
+            self.assertLess(
+                err, self.DK_GRAD_RTOL, f"{tag}: param {name} {err:.3e}"
+            )
+        # The harness' own print covers ``strict`` only, and these are the two
+        # that drift, so keep them on the log.
+        print(
+            f"[cp{H.CP_SIZE} rank{H.CP_RANK}] {tag}: dk_param_max="
+            f"{max(noisy.values(), default=0.0):.2e}",
+            flush=True,
+        )
+
+    def _run(self, backend, doc_lens, masked, row_end=None):
+        """``run_core_cp`` with every module it builds forced onto ``backend``.
+
+        ``_forward_warmup`` reads ``self.config.csa_indexer_backend`` at call
+        time, so overriding it post-build is enough -- and it puts the CP=1
+        reference on the same backend, which is what keeps ``_check`` a CP claim
+        instead of a backend comparison.
+        """
+        original = H._build
+
+        def build(*args, **kwargs):
+            module = original(*args, **kwargs)
+            module.config.csa_indexer_backend = backend
+            return module
+
+        with mock.patch.object(H, "_build", build):
+            return H.run_core_cp(
+                "mqa_dsa",
+                doc_lens,
+                loss_coeff=0.1,
+                with_input_ids=masked,
+                sparse_loss=False,
+                row_end=row_end,
+            )
+
+    def _layouts(self):
+        """``(label, doc_lens, masked, row_end)``.
+
+        ``masked`` flips the loss denominator between ``_indexer_loss_mask``'s
+        global valid-row count and the all-ones fallback; the pad layout adds
+        rows whose ``index_lse`` the dense path sets to ``+inf`` to gate them
+        out, all of them on the last rank.
+        """
+        return [
+            ("straddle masked", _STRADDLE, True, None),
+            ("straddle unmasked", _STRADDLE, False, None),
+            ("single doc", [S_GLOBAL], True, None),
+            ("pad rows", None, True, _pad_row_end(_PAD_DOC_LEN, S_GLOBAL)),
+        ]
+
+    @H.U._GPU
+    def test_1_cudnn_warmup_cp_equivalence(self):
+        """The CP contract holds on the dense cuDNN KL, on four layouts."""
+        for label, doc_lens, masked, row_end in self._layouts():
+            with self.subTest(layout=label):
+                tag = f"cudnn-cp/{label}"
+                res = self._run(
+                    backend="cudnn",
+                    doc_lens=doc_lens,
+                    masked=masked,
+                    row_end=row_end,
+                )
+                self.assertTrue(
+                    any(n.startswith("indexer.") for n in res["param_err"]),
+                    f"{tag}: the indexer received no gradient, so this layout "
+                    f"never ran the KL",
+                )
+                self._check(res, tag)
+                self._assert_loss_cp_sum(res, tag)
+
+    @H.U._GPU
+    def test_2_cudnn_and_tilelang_agree_on_the_cp_summed_loss(self):
+        """Cross-backend: the same objective, the same THD/table slicing.
+
+        Both losses are summed over the CP group first, so a border that is
+        wrong on one rank only still shows up here.
+        """
+        for label, doc_lens, masked, row_end in self._layouts():
+            with self.subTest(layout=label):
+                sums = {}
+                for backend in ("tilelang", "cudnn"):
+                    res = self._run(
+                        backend=backend,
+                        doc_lens=doc_lens,
+                        masked=masked,
+                        row_end=row_end,
+                    )
+                    total = paddle.to_tensor(
+                        [res["logged_cp"]], dtype="float64"
+                    )
+                    dist.all_reduce(total, group=H.CP_GROUP)
+                    sums[backend] = float(total[0])
+                got, want = sums["cudnn"], sums["tilelang"]
+                rel = abs(got - want) / max(abs(want), 1e-30)
+                print(
+                    f"[kl-backends-cp{H.CP_SIZE} rank{H.CP_RANK}] {label}: "
+                    f"tilelang={want:.6e} cudnn={got:.6e} rel={rel:.3e}",
+                    flush=True,
+                )
+                self.assertLess(
+                    rel,
+                    self.BACKEND_RTOL,
+                    f"{label}: the dense cuDNN KL sums to {got:.6e} across the "
+                    f"CP group where tilelang sums to {want:.6e} "
+                    f"(rel {rel:.3e}) -- the two candidate sets differ",
+                )
 
 
 if __name__ == "__main__":
