@@ -24,8 +24,7 @@ phase has its own ``_forward_*`` with no loss code shared between them:
 * ``"mqa_full_causal"`` -> ``_forward_full_causal``. Latent MQA with the indexer
   dropped, attending to the full per-document causal set. Mathematically
   identical to the dense MHA phase, so it isolates the absorption from the
-  sparsity for equivalence experiments; ``O(s^2)`` in index memory and therefore
-  not a production mode.
+  sparsity for equivalence experiments.
 * ``"mqa_dsa"`` + ``dsa_indexer_use_sparse_loss=False`` -> ``_forward_warmup``
   (phase 2, DSA warmup, paired with ``train_indexer_only``). The backbone is
   frozen and the indexer is random, so **neither side uses top-k**: attention
@@ -38,6 +37,14 @@ phase has its own ``_forward_*`` with no loss code shared between them:
   selected set. This is the only phase that reads ``index_topk``.
 
 The indexer reuses the model-wide ``index_n_heads`` / ``index_head_dim``.
+
+The two full-causal phases attend over the whole per-document causal span, which
+is exactly what the caller's ``attn_mask_startend_row_indices`` already says, so
+they run as dense FA4 flashmask (``_dense_attn``), context parallel included.
+FA4 is their only backend: ``_assert_dense_fa4`` refuses to start rather than
+substitute one that would need an ``O(s^2)`` column table (see
+``_dense_attn`` for what that costs). Only phase 3 genuinely selects columns,
+and only it builds a table.
 
 Note the ``mqa_*`` modes here are *latent* MQA (this module). A
 ``csa_compress_ratios`` entry of ``-1`` is *CSA full-causal MQA*, a different
@@ -81,11 +88,14 @@ space the all-gathered KV is indexed in. ``attn_mask_startend_row_indices``
 already arrives at the global length under CP
 (``dsv4_hybrid_attention.py:634``), while ``query`` / ``key`` / ``x`` / ``qr``
 arrive local but RoPE'd with global positions
-(``multi_latent_attention.py:1485-1545``).
+(``multi_latent_attention.py:1485-1545``). The dense full-causal backend needs
+one extra step for the same reason -- its mask is a *row* bound, not a column id
+-- which ``_cp_row_bounds`` does.
 """
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -94,12 +104,14 @@ import paddle.nn.functional as F
 from paddle import Tensor
 from paddle.distributed.fleet.meta_parallel import LayerSpec, build_spec_layer
 
-from paddlefleet.context_parallel_utils import ContextParallelGatherOp
+from paddlefleet.context_parallel_utils import (
+    ContextParallelGatherOp,
+    preprocess_index,
+)
 from paddlefleet.process_groups_config import ProcessGroupCollection
 from paddlefleet.transformer.cp_utils import all_gather_cp
 from paddlefleet.transformer.csa_attention import (
     TileLangCSAIndexerLossAutoScaler,
-    _build_mqa_causal_topk_idxs_from_doc_bounds,
     _build_window_topk_idxs_from_doc_bounds,
     _derive_csa_doc_boundaries,
     _validate_csa_docmask_shape,
@@ -128,6 +140,50 @@ _LSE_INDEXER_TOPKS = (512, 1024, 2048)
 _TARGET_QHEAD_MIN = 16
 _NEG_INF = -1e30
 _EPS = 1e-10
+
+logger = logging.getLogger(__name__)
+
+
+def _dense_pylayer_inputs(
+    query: Tensor, key: Tensor, value: Tensor, sink: Tensor | None
+) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    """Make the flashmask ``PyLayer``'s differentiable inputs agree on freezing.
+
+    ``flashmask_attention`` is a ``PyLayer``, and Paddle requires its backward to
+    return ``None`` at exactly the positions whose forward input had
+    ``stop_gradient=True``. The flash kernel returns a dense gradient at every
+    position instead, so any *partially* frozen call aborts with
+    ``FlashMaskFunc's backward function should return None at N position``
+    (``py_layer_node.cc:213``). Frozen inputs are not exotic here: the warmup
+    phase runs under ``train_indexer_only``, which freezes the backbone, and the
+    attention sink is a parameter of its own, so which subset arrives frozen
+    depends on the configuration rather than on this layer.
+
+    Two regimes, and this returns the right thing for both:
+
+    * nothing wants a gradient -- pass everything through, so no grad node is
+      built at all and the contract never comes up;
+    * something wants one -- hand the kernel a detached ``stop_gradient=False``
+      view of each frozen input. The unwanted gradient lands on that throwaway
+      view and is dropped, the real tensor stays frozen and receives nothing,
+      and the forward is bit-identical (measured). Neither ``detach()`` alone
+      nor ``* 1.0`` works: both inherit ``stop_gradient``.
+
+    The sparse backend needs none of this -- it records
+    ``attn_sink_needs_grad`` itself (``csa_sparse_attn.py:178-182``).
+    """
+    tensors = (query, key, value, sink)
+    if all(t is None or t.stop_gradient for t in tensors):
+        return tensors
+
+    def proxy(t):
+        if t is None or not t.stop_gradient:
+            return t
+        out = t.detach()
+        out.stop_gradient = False
+        return out
+
+    return tuple(proxy(t) for t in tensors)
 
 
 class _HashableTensor(paddle.Tensor):
@@ -446,12 +502,8 @@ class MQALatentAttention(FleetLayer):
                 query,
                 kv,
                 v_b_proj_weight,
-                doc_start,
-                is_valid,
                 kv_lora_rank,
-                position_offset,
-                s,
-                s_global,
+                row_end,
             )
 
         if phase == "warmup":
@@ -469,6 +521,7 @@ class MQALatentAttention(FleetLayer):
                 position_offset,
                 s,
                 s_global,
+                row_end,
             )
 
         return self._forward_sparse(
@@ -494,12 +547,8 @@ class MQALatentAttention(FleetLayer):
         query: Tensor,
         kv: Tensor,
         v_b_proj_weight: Tensor,
-        doc_start: Tensor,
-        is_valid: Tensor,
         kv_lora_rank: int,
-        position_offset: int,
-        s_local: int,
-        s_global: int,
+        row_end: Tensor,
     ) -> Tensor:
         """Per-document full-causal attention on the absorbed latent.
 
@@ -511,14 +560,15 @@ class MQALatentAttention(FleetLayer):
         Used by two phases -- ``hybrid_mla_attention="mqa_full_causal"``, and
         the attention half of the phase-2 warmup, which must not consume the
         indexer's ranking while the indexer is still being learned.
+
+        One backend: dense FA4 flashmask (``_dense_attn``). "The whole causal
+        span" is already what ``attn_mask_startend_row_indices`` says, so the
+        mask stays ``O(s)``; ``_assert_dense_fa4`` rejects an environment where
+        FA4 would not serve it.
         """
-        b = int(query.shape[0])
-        token_indices = self._build_full_causal_indices(
-            b, s_global, doc_start, is_valid, position_offset, s_local
-        )
-        core_out = self._sparse_attn(
-            query, kv, token_indices, self.softmax_scale, kv_lora_rank
-        )
+        q_dim = int(query.shape[-1])
+        self._assert_dense_fa4(q_dim, kv_lora_rank, row_end)
+        core_out = self._dense_attn(query, kv, row_end, kv_lora_rank)
         return self._deabsorb(core_out, v_b_proj_weight, self.split_kv_b)
 
     # ------------------------------------------------------------------
@@ -539,31 +589,34 @@ class MQALatentAttention(FleetLayer):
         position_offset: int,
         s_local: int,
         s_global: int,
+        row_end: Tensor,
     ) -> Tensor:
         """Phase 2: frozen backbone, full-causal attention, full-causal KL.
 
         No top-k on either side. The two halves:
 
-        * **attention** is the same deterministic full-causal set phase 1 uses
-          (``_forward_full_causal``), so the frozen backbone sees exactly the
-          activations it was pretrained with while the indexer is still random.
+        * **attention** is the same deterministic full-causal set phase 1 uses,
+          so the frozen backbone sees exactly the activations it was pretrained
+          with while the indexer is still random -- literally the same
+          ``_forward_full_causal`` call.
         * **the indexer** is supervised over the *whole* per-document causal
           span, so it cannot reinforce its own initial ranking.
 
-        Both come from one tilelang call with ``topk_effective = s_global``, which
-        is the "full-candidate selection" mode ``csa_indexer_topk_fwd`` documents
-        for exactly this phase -- the CSA layers use it the same way with
-        ``topk_effective = n_compressed``. The kernel returns the softmax
+        The indexer half is one tilelang call with ``topk_effective = s_global``,
+        which is the "full-candidate selection" mode ``csa_indexer_topk_fwd``
+        documents for exactly this phase -- the CSA layers use it the same way
+        with ``topk_effective = n_compressed``. The kernel returns the softmax
         probabilities over every candidate column plus the column ids, and the
         head dimension never leaves the kernel; the backward is upstream's
         ``csa_indexer_bwd`` via ``TileLangCSAIndexerLossAutoScaler``, whose
         tilelang branch computes exactly ``(P - Q) * coeff / valid_rows``.
 
-        Recompute: the attention column table depends only on the document
-        boundaries, so the two forwards of a recompute segment are bit-identical
-        and there is no top-k tie-break to worry about. The loss is attached on
-        the grad-enabled forward only, so it is counted once; the no-grad forward
-        skips the indexer entirely rather than computing and discarding it.
+        Recompute: the attention mask is the caller's own row-end vector, so the
+        two forwards of a recompute segment are bit-identical and there is no
+        top-k tie-break to worry about. The loss is
+        attached on the grad-enabled forward only, so it is counted once; the
+        no-grad forward skips the indexer entirely rather than computing and
+        discarding it.
 
         CP: ``index_k`` is all-gathered to ``s_global`` inside
         ``forward_before_topk`` and ``kv`` by the caller, ``valid_range`` is built
@@ -577,12 +630,8 @@ class MQALatentAttention(FleetLayer):
             query,
             kv,
             v_b_proj_weight,
-            doc_start,
-            is_valid,
             kv_lora_rank,
-            position_offset,
-            s_local,
-            s_global,
+            row_end,
         )
         if not self._needs_indexer_loss():
             return output
@@ -704,28 +753,6 @@ class MQALatentAttention(FleetLayer):
     # ------------------------------------------------------------------
     # index construction / kernel plumbing
     # ------------------------------------------------------------------
-    @staticmethod
-    def _build_full_causal_indices(
-        b, s_global, doc_start, is_valid, position_offset=0, s_local=None
-    ) -> Tensor:
-        """Per-document full-causal ``[b, s_local, s_global]`` int32 (``-1`` pad).
-
-        Built over the global sequence and row-sliced to this CP rank, so the
-        column values stay global token ids. ``O(s_global^2)`` while building,
-        which is why this mode is an equivalence experiment, not production.
-        """
-        with paddle.no_grad():
-            indices, _ = _build_mqa_causal_topk_idxs_from_doc_bounds(
-                b, s_global, doc_start, is_valid
-            )
-            if s_local is not None and s_local != s_global:
-                indices = indices[
-                    :, position_offset : position_offset + s_local
-                ]
-            indices = indices.contiguous()
-        indices.stop_gradient = True
-        return indices
-
     def _indexer_projections(self, x, qr, position_offset, grad_enabled):
         """``(index_q, index_k, weights)`` from the DSA indexer.
 
@@ -825,6 +852,171 @@ class MQALatentAttention(FleetLayer):
             attn_sink=self.softmax_offset,
             indexer_topk=indexer_topk,
             sink_grad_fusion=self.sink_grad_fusion,
+        )
+
+    @staticmethod
+    def _assert_dense_fa4(q_dim: int, v_dim: int, row_end: Tensor) -> None:
+        """Refuse to run the full-causal phases on anything but FA4.
+
+        Applies to both phases that attend over the whole per-document causal
+        span -- ``mqa_full_causal`` and the attention half of the warmup. FA4 is
+        the only backend they support: query/key are
+        ``kv_lora_rank + qk_rope_head_dim`` wide while the value is only
+        ``kv_lora_rank``, a pair FA2/FA3 serve by padding the value out to the
+        query width, and the alternative of expanding the document mask into a
+        ``[b, s, s]`` column table for the sparse kernel costs ``O(s^2)`` memory
+        (100 GiB at s=65536 on the production geometry -- see ``_dense_attn``)
+        and is not addressable in int32 past s=46336. Neither is worth having as
+        a silent substitution, so fail here instead.
+
+        ``get_fa_version`` answers from the head-dim whitelist *and* two
+        process-global flags, so all three inputs go into the message -- the
+        head-dim pair alone rarely explains the answer. In particular
+        ``FLAGS_flash_attn_version`` must be 4, which production sets from the
+        compute capability (``TrainingArguments.__post_init__``, SM100 -> 4), and
+        ``FLAGS_cudnn_deterministic`` must be off, since FA4's big-head-dim
+        backward has no ordered-accumulation variant
+        (``flash_mask/cute/interface.py:1238,1249``).
+
+        Checked every forward rather than in ``__init__``: the flags are
+        settable at any point and the check is a whitelist lookup.
+        """
+        from paddlefleet_ops.flash_mask_facade import get_fa_version
+
+        fa_version = get_fa_version(q_dim, v_dim, row_end)
+        if fa_version != 4:
+            flags = paddle.get_flags(
+                ["FLAGS_flash_attn_version", "FLAGS_cudnn_deterministic"]
+            )
+            raise RuntimeError(
+                "latent MQA full-causal attention requires FA4 dense "
+                f"flashmask, but head dims ({q_dim}, {v_dim}) resolve to "
+                f"FA{fa_version}. FLAGS_flash_attn_version="
+                f"{flags['FLAGS_flash_attn_version']}, "
+                "FLAGS_cudnn_deterministic="
+                f"{flags['FLAGS_cudnn_deterministic']}. Run on a device whose "
+                "compute capability selects FA4 (SM100+, which is also what the "
+                "sparse phase-3 kernels require), leave "
+                "FLAGS_flash_attn_version at the value the trainer derives, and "
+                "keep FLAGS_cudnn_deterministic off -- FA4 has no deterministic "
+                "backward for this head-dim pair."
+            )
+
+    def _dense_attn(
+        self, query: Tensor, kv: Tensor, row_end: Tensor, kv_lora_rank: int
+    ) -> Tensor:
+        """Per-document dense causal MQA on the absorbed latent, via FA4.
+
+        Mathematically the same softmax over the same column set the phase-3
+        sparse kernel would compute from an explicit ``[b, s, s]`` table, but the
+        causal/document structure stays in ``startend_row_indices`` -- the
+        caller's own ``attn_mask_startend_row_indices``, already in flashmask's
+        per-column "masked from this row on" convention -- so the mask never gets
+        expanded.
+
+        That expansion is what would make the full-causal phases quadratic.
+        Measured peaks at s = 8192 / 32768 / 65536, production geometry (h=64,
+        d_v=256), net allocated over the module's own steady state:
+
+        * building the table alone: 1.6 / 25.0 / 100.0 GiB -- 6.25x the table's
+          own ``s^2`` int32 (0.25 / 4.0 / 16.0 GiB), the rest being int64
+          intermediates in ``_derive_csa_doc_boundaries``;
+        * dense forward + backward: 3.3 / 13.0 / 26.0 GiB, i.e. linear.
+
+        Past s=46336 that table is not merely expensive but unusable: the sparse
+        kernel flattens it with int32 ids
+        (``csa_sparse_attn_utils.py::_local_to_global_flat``, ``row * topk + col``
+        after padding ``topk`` up to 64), so the row base wraps -- measured
+        s=46337 returns finite but wrong numbers for its last 55 rows (cosine
+        0.7296 against this backend) and only s=46341 crashes.
+
+        The key is broadcast MQA (one head against ``h`` query heads) and the
+        value is its first ``kv_lora_rank`` channels, so nothing is materialised
+        per head. Output is flattened to the ``[b, s, h * kv_lora_rank]`` layout
+        ``_deabsorb`` consumes.
+
+        Under CP the row bounds are localised first and the kernel's own causal
+        mode is turned off; see ``_cp_row_bounds``.
+        """
+        from paddlefleet_ops.flash_mask_facade import flashmask_attention
+
+        if self.cp_size > 1:
+            row_end = self._cp_row_bounds(row_end, int(query.shape[1]))
+
+        key = kv.unsqueeze(2)
+        query, key, value, sink = _dense_pylayer_inputs(
+            query, key, key[..., :kv_lora_rank], self.softmax_offset
+        )
+        core_out = flashmask_attention(
+            query,
+            key,
+            value,
+            startend_row_indices=row_end,
+            causal=self.cp_size == 1,
+            learnable_sink=sink,
+            softmax_scale=self.softmax_scale,
+        )
+        b, s = core_out.shape[:2]
+        return core_out.reshape([b, s, -1])
+
+    def _cp_row_bounds(self, row_end: Tensor, s_local: int) -> Tensor:
+        """Global ``[LTS]`` row bounds -> this rank's local ``[LTS, UTE]`` pair.
+
+        ``flashmask_attention``'s own ``causal=True`` bottom-right-aligns the
+        diagonal: it masks column ``j`` above row ``j + seqlen_k - seqlen_q``
+        (``flash_mask/cute/flashmask_utils.py:650``, ``:411``, and the comment at
+        ``flash_bwd_sm100_bigd.py:2009``). Under CP this rank holds query rows
+        ``[cp_rank * s_local, (cp_rank + 1) * s_local)`` against an all-gathered
+        ``s_global`` key, so that implied offset -- ``s_global - s_local`` -- is
+        only the right one for the last rank. Handing the kernel the global
+        ``row_end`` with ``causal=True`` therefore returns *silently* wrong
+        numbers on every other rank (measured cosine 2.7e-1 at cp_size=2, no
+        exception), and the document bounds are wrong on every rank including the
+        last, since their values are global row ids compared against local ones.
+
+        The fix is the contract the rest of the model's CP attention already
+        uses: express the diagonal as an explicit second flashmask bound instead
+        of asking the kernel for it, then shift both bounds into this rank's row
+        space. ``DotProductAttention`` does exactly this at
+        ``dot_product_attention.py:614-617`` (``is_causal = False`` plus a
+        two-column mask), the HySparse MLA scorer at
+        ``multi_latent_attention.py:1233-1245``, and ``FlashMaskContextParallel``
+        rejects ``causal=True`` outright for the same reason
+        (``context_parallel_utils.py:1116-1119``).
+
+        With ``causal=False`` and two bounds the kernel reads them as
+        ``[LTS, UTE]`` (``flashmask_utils.py:261-270``) and masks
+        ``row >= LTS or row < UTE`` (``mask.py:513-518``), i.e. column ``j`` is
+        visible on rows ``[UTE_j, LTS_j)``. So ``UTE_j = j`` reproduces the
+        causal diagonal in *global* rows, ``LTS_j`` stays the caller's document
+        end, and ``preprocess_index`` -- the same helper
+        ``cp_flashmask_allgatherkv_balance_forward`` uses for this mode
+        (``context_parallel_utils.py:716-721``) -- shifts both by
+        ``cp_rank * s_local`` and clips to ``[0, s_local]``. Only
+        ``contiguous_allgather`` is localised this way, which is the only mode
+        this class accepts (``__init__``).
+
+        Worked example, ``s_global=8``, two documents ``0-3`` / ``4-7``,
+        ``cp_size=2``. Global bounds ``LTS=[4,4,4,4,8,8,8,8]``,
+        ``UTE=[0,1,2,...,7]``. On rank 1 (rows 4-7) they become
+        ``LTS'=[0,0,0,0,4,4,4,4]`` and ``UTE'=[0,0,0,0,0,1,2,3]``: document A's
+        columns are masked on every local row (``LTS'=0``), and column 5 is
+        visible on local rows 1-3, i.e. global rows 5-7. Both correct, where
+        ``causal=True`` on the unshifted bounds would have left document A fully
+        visible.
+        """
+        s_global = int(row_end.shape[2])
+        causal_end = paddle.arange(s_global, dtype=row_end.dtype).reshape(
+            [1, 1, s_global, 1]
+        )
+        bounds = paddle.concat(
+            [row_end, paddle.expand_as(causal_end, row_end)], axis=-1
+        )
+        return preprocess_index(
+            bounds,
+            chunk_id=self.cp_rank,
+            seq_blocksize=s_local,
+            max_seqlen_q=s_local,
         )
 
     @staticmethod
