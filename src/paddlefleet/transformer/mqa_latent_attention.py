@@ -1081,7 +1081,10 @@ class MQALatentAttention(FleetLayer):
           :meth:`_warmup_kl_dense_cudnn`.
 
         Both compute the same objective; the switch is a memory/width trade, not
-        a change of loss.
+        a change of loss. The field's third value, ``"unfused"``, has no
+        full-candidate implementation of its own and is served by tilelang --
+        explicitly, and with tilelang's width and head-count limits still
+        enforced by name.
         """
         output = self._forward_full_causal(
             query,
@@ -1093,7 +1096,8 @@ class MQALatentAttention(FleetLayer):
         if not self._needs_indexer_loss():
             return output
 
-        if self.config.csa_indexer_backend == "cudnn":
+        backend = self.config.csa_indexer_backend
+        if backend == "cudnn":
             return self._warmup_kl_dense_cudnn(
                 output,
                 query,
@@ -1109,11 +1113,20 @@ class MQALatentAttention(FleetLayer):
                 s_global,
                 meta=meta,
             )
+        # ``__post_init__`` narrowed the field to {unfused, tilelang, cudnn}, so
+        # everything left here is ``tilelang`` or ``unfused``, and both are
+        # served by tilelang: this phase's KL never had a pure-paddle
+        # implementation to offer as ``unfused`` (the reference
+        # ``FusedDSAIndexerLoss`` is a top-k loss, not a full-candidate one), and
+        # several existing hybrid-MLA suites configure ``unfused`` while running
+        # this path. Tilelang's own two limits are not silent under that name:
+        # the check below runs before the import and raises naming the width or
+        # head bound and pointing at ``"cudnn"``.
+        self._check_tilelang_indexer_support(s_global)
 
         from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
 
         b = int(query.shape[0])
-        self._check_tilelang_indexer_support(s_global)
         index_q, index_k, weights = self._indexer_projections(
             x, qr, position_offset, grad_enabled=True
         )
@@ -1460,13 +1473,17 @@ class MQALatentAttention(FleetLayer):
         does so from inside the backward, i.e. from a recompute replay. Reject it
         here instead. The batch size needs no check -- ``forward`` already
         requires 1.
+
+        Not a reason to point at tilelang: that path pins ``index_n_heads`` to
+        exactly 64 as well (see :meth:`_check_tilelang_indexer_support`), so a
+        narrower indexer has no warmup KL backend at all.
         """
         heads = int(self.indexer.n_heads)
         if heads < 64:
             raise ValueError(
                 "the dense cuDNN indexer backward requires index_n_heads >= 64, "
-                f"got {heads}. Use csa_indexer_backend='tilelang' for narrow "
-                "unit-test geometries."
+                f"got {heads}. Raise index_n_heads to 64; the tilelang backend "
+                "requires exactly 64 too, so it is not a way around this."
             )
 
     def _check_tilelang_indexer_support(self, width: int) -> None:
