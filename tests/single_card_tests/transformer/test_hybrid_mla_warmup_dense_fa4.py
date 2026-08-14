@@ -340,6 +340,40 @@ class TestBackendSelection(unittest.TestCase):
         """
         self._assert_forward_refuses(_module(), deterministic=1)
 
+    def test_missing_flash_mask_extension_raises(self):
+        """FA4 as a flag value is not FA4 as a backend.
+
+        ``get_fa_version`` reads flags and head dims only, so on an image built
+        without the flash_mask (cute) extension it still answers 4 while the
+        facade has bound ``_flashmask_attention`` to Paddle's native one
+        (``flash_mask_facade.py``, ``else`` branch of the
+        ``is_flash_mask_available()`` guard) -- which serves neither this
+        head-dim pair nor the sink. Left to the kernel the failure reads
+        ``Invalid flash attention version: 4``, from a frame that names nothing
+        about this layer, so availability is part of the check here.
+        """
+        import paddlefleet_ops
+
+        module = _module()
+        row_end = _row_end([256], 256)
+        original = paddlefleet_ops.is_flash_mask_available
+        paddlefleet_ops.is_flash_mask_available = lambda: False
+        try:
+            with (
+                _flash_attn_version(4),
+                self.assertRaises(RuntimeError) as caught,
+            ):
+                module._assert_dense_fa4(576, 512, row_end)
+        finally:
+            paddlefleet_ops.is_flash_mask_available = original
+        message = str(caught.exception)
+        self.assertIn("requires FA4", message)
+        self.assertIn("flash_mask_available=False", message)
+        # Same call passes again with the extension back, so nothing but the
+        # availability answer decided it.
+        with _flash_attn_version(4):
+            self.assertIsNone(module._assert_dense_fa4(576, 512, row_end))
+
     def test_full_causal_phase_also_takes_the_dense_path(self):
         """Phase 1 attends over the same whole causal span, so same backend.
 

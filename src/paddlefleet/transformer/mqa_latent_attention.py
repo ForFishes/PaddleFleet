@@ -878,25 +878,38 @@ class MQALatentAttention(FleetLayer):
         backward has no ordered-accumulation variant
         (``flash_mask/cute/interface.py:1238,1249``).
 
+        ``get_fa_version`` answers from flags alone and never checks that an FA4
+        backend exists, so the extension's availability is a separate condition
+        here. Without it the facade binds ``_flashmask_attention`` to Paddle's
+        native implementation (``flash_mask_facade.py``, the ``else`` branch of
+        the ``is_flash_mask_available()`` import guard), which serves neither
+        this head-dim pair nor the sink, and the failure would surface from
+        inside the kernel call as ``Invalid flash attention version: 4`` -- true
+        but not actionable.
+
         Checked every forward rather than in ``__init__``: the flags are
         settable at any point and the check is a whitelist lookup.
         """
+        from paddlefleet_ops import is_flash_mask_available
         from paddlefleet_ops.flash_mask_facade import get_fa_version
 
         fa_version = get_fa_version(q_dim, v_dim, row_end)
-        if fa_version != 4:
+        flash_mask_ok = is_flash_mask_available()
+        if fa_version != 4 or not flash_mask_ok:
             flags = paddle.get_flags(
                 ["FLAGS_flash_attn_version", "FLAGS_cudnn_deterministic"]
             )
             raise RuntimeError(
                 "latent MQA full-causal attention requires FA4 dense "
                 f"flashmask, but head dims ({q_dim}, {v_dim}) resolve to "
-                f"FA{fa_version}. FLAGS_flash_attn_version="
+                f"FA{fa_version} and flash_mask_available="
+                f"{flash_mask_ok}. FLAGS_flash_attn_version="
                 f"{flags['FLAGS_flash_attn_version']}, "
                 "FLAGS_cudnn_deterministic="
                 f"{flags['FLAGS_cudnn_deterministic']}. Run on a device whose "
                 "compute capability selects FA4 (SM100+, which is also what the "
-                "sparse phase-3 kernels require), leave "
+                "sparse phase-3 kernels require) with the flash_mask (cute) "
+                "extension built into paddlefleet_ops, leave "
                 "FLAGS_flash_attn_version at the value the trainer derives, and "
                 "keep FLAGS_cudnn_deterministic off -- FA4 has no deterministic "
                 "backward for this head-dim pair."
