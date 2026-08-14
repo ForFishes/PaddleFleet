@@ -77,6 +77,8 @@ Run (2 or 4 GPUs)::
 test_mqa_dsa_warmup_cp.py
 """
 
+import os
+import sys
 import unittest
 from unittest import mock
 
@@ -84,9 +86,15 @@ import numpy as np
 import paddle
 import paddle.distributed as dist
 
-# ``paddle.distributed.launch <thisfile>`` puts this directory on ``sys.path``,
-# so the sibling harness imports as a top-level module (same as
-# ``test_mla_cp_recompute`` importing ``test_mla_cp_contiguous_allgather``).
+# The sibling harness is imported as a top-level module, so this directory has
+# to be on ``sys.path``. ``python <thisfile>`` -- what
+# ``paddle.distributed.launch`` runs -- puts it there as ``sys.path[0]``, but the
+# coverage-instrumented CI runner starts the same file as ``python -m coverage
+# run <abs path>``, where ``-m`` claims ``sys.path[0]`` for the CWD instead and
+# the import fails before a single test is collected. Add the file's own
+# directory explicitly so both entry points resolve it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import test_mqa_dsa_cp as H
 
 from paddlefleet.transformer.csa_attention import _derive_csa_doc_boundaries
