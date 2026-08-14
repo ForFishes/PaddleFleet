@@ -118,6 +118,7 @@ from paddlefleet.transformer.csa_attention import (
 )
 from paddlefleet.transformer.dot_product_attention import build_softmax_offset
 from paddlefleet.transformer.dsa_attention import (
+    DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
 from paddlefleet.transformer.layer import FleetLayer
@@ -140,6 +141,21 @@ _LSE_INDEXER_TOPKS = (512, 1024, 2048)
 _TARGET_QHEAD_MIN = 16
 _NEG_INF = -1e30
 _EPS = 1e-10
+# Widest full-candidate KL the tilelang indexer can launch. Its two bitonic
+# buffers are sized ``2 * topk``, so one block asks for ``16 * topk + 25344`` B
+# against the SM100 opt-in limit of 232448 B: ``topk <= 12944``, i.e. 8192 as a
+# power of two. Measured: width 16384 fails with ``Failed to set the allowed
+# dynamic shared memory size to 287488``, 8192 launches. Not a config knob --
+# it is a property of the device -- so the warmup KL rejects wider spans and
+# points at ``csa_indexer_backend="cudnn"`` instead.
+_TILELANG_KL_MAX_WIDTH = 8192
+# Row-chunk budgets, in tensor elements, for the two loops of the dense
+# (full-candidate) warmup KL. The LSE loop materialises ``[c, h, k_end]`` twice
+# (bf16 matmul output plus its fp32 mask/where copy), so 16Mi elements is ~128MB
+# transient; the KL reduction materialises ``[c, width]`` a few times over, and
+# 64Mi elements keeps it in the same ballpark.
+_LSE_CHUNK_ELEMS = 1 << 24
+_KL_CHUNK_ELEMS = 1 << 26
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +202,22 @@ def _dense_pylayer_inputs(
     return tuple(proxy(t) for t in tensors)
 
 
+def _doc_segment_lens(doc_starts: Tensor, s_global: int) -> list[int]:
+    """Segment lengths that tile ``[0, s_global)``, padding slots included.
+
+    ``_derive_csa_doc_boundaries`` returns document *content* lengths, which stop
+    short of the slot when a document is padded. Feeding those to
+    ``dense_kl_cu_seqlens`` would leave a hole between segments and let the next
+    document's tokens into a query's causal prefix, so the borders are taken from
+    the starts instead: consecutive differences, with the tail reaching
+    ``s_global``. Padding rows keep their preceding document's segment, which is
+    what the row gating already assumes.
+    """
+    starts = [int(v) for v in doc_starts.tolist()]
+    ends = [*starts[1:], int(s_global)]
+    return [b - a for a, b in zip(starts, ends)]
+
+
 class _HashableTensor(paddle.Tensor):
     """``paddle.Tensor`` with hashable ``shape`` / ``stride()``.
 
@@ -202,6 +234,179 @@ class _HashableTensor(paddle.Tensor):
         if dim is None:
             return tuple(super().stride())
         return super().stride(dim)
+
+
+@dataclass
+class DenseWarmupKLPlan:
+    """Everything the dense warmup KL backward needs that is not a grad input.
+
+    Passed to :class:`DenseWarmupIndexerLossAutoScaler` as a single opaque
+    object on purpose: Paddle's ``PyLayer`` counts *tensor* arguments to decide
+    how many gradients ``backward`` must return, so bundling the THD descriptors
+    in here keeps that count at the four differentiable tensors instead of
+    making it depend on which of ``q_causal_offsets`` / ``row_active`` happens to
+    be present.
+
+    Attributes:
+        cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        q_causal_offsets: THD descriptors from ``dense_kl_cu_seqlens``, shared
+            by the indexer score, the attention score and the backward -- all
+            three must see the same segmentation and the same ``max_seqlen_k``,
+            since the backward's shape check ties the two score matrices
+            together.
+        loss_coeff: already carries the ``total_q / num_rows`` compensation for
+            the backward kernel's built-in ``1 / total_q``; see
+            :meth:`MQALatentAttention._warmup_kl_dense_cudnn`.
+        softmax_scale: the attention scale, needed to recompute the target.
+        block_I: backward tile width.
+    """
+
+    cu_seqlens_q: Tensor
+    cu_seqlens_k: Tensor
+    max_seqlen_q: int
+    max_seqlen_k: int
+    q_causal_offsets: Tensor | None
+    loss_coeff: float
+    softmax_scale: float
+    block_I: int = 128
+
+
+class DenseWarmupIndexerLossAutoScaler(paddle.autograd.PyLayer):
+    """Attach the dense full-candidate warmup KL gradient to the main output.
+
+    The dense counterpart of ``TileLangCSAIndexerLossAutoScaler``, and separate
+    from it on purpose: that class carries a ``[b, s, width]`` ``target`` and
+    ``topk_probs`` pair from forward into backward, which is exactly the
+    ``O(s_local x s_global)`` residency this path exists to remove. Here nothing
+    width-proportional is saved -- the backward recomputes both score matrices
+    from the same inputs the forward used, which is what the cuDNN dense triple
+    is designed for.
+
+    Saved tensors are the recompute inputs (``index_q`` / ``weights`` /
+    ``index_k`` / ``query`` / ``kv``) plus the tiny ``[s_local, h]`` attention
+    LSE. ``attn_lse`` is *not* recomputable cheaply, and it is also where row
+    gating lives: an inactive row carries ``+inf``, which makes its attention
+    score row zero and, together with the ``+inf`` this backward writes into
+    ``index_lse``, drives the row's gradient to an exact zero.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        output: Tensor,
+        index_q: Tensor,
+        weights: Tensor,
+        index_k: Tensor,
+        query: Tensor,
+        kv: Tensor,
+        attn_lse: Tensor,
+        row_active: Tensor,
+        plan: DenseWarmupKLPlan,
+    ) -> Tensor:
+        ctx.save_for_backward(
+            index_q.detach(),
+            weights.detach(),
+            index_k.detach(),
+            query.detach(),
+            kv.detach(),
+            attn_lse.detach(),
+            row_active,
+        )
+        ctx.plan = plan
+        # Same contract as ``TileLangCSAIndexerLossAutoScaler.forward``: with the
+        # backbone frozen, ``output`` is a leaf with ``stop_gradient=True`` and
+        # returning it unchanged would look like an inplace alias.
+        ctx.output_needs_grad = not output.stop_gradient
+        return output if ctx.output_needs_grad else output.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        from paddlefleet.cudnn_ops import (
+            dense_attn_kl_scores,
+            dense_indexer_kl_bwd,
+            dense_indexer_kl_scores,
+        )
+
+        (
+            index_q,
+            weights,
+            index_k,
+            query,
+            kv,
+            attn_lse,
+            row_active,
+        ) = ctx.saved_tensor()
+        plan = ctx.plan
+        thd = {
+            "cu_seqlens_q": plan.cu_seqlens_q,
+            "cu_seqlens_k": plan.cu_seqlens_k,
+            "max_seqlen_q": plan.max_seqlen_q,
+            "max_seqlen_k": plan.max_seqlen_k,
+            "q_causal_offsets": plan.q_causal_offsets,
+        }
+
+        index_score, index_lse = dense_indexer_kl_scores(
+            index_q, index_k, weights, **thd
+        )
+        # Row gating, and the reason it sits on ``index_lse`` rather than on the
+        # attention side: ``+inf`` here zeroes both factors of the kernel's score
+        # gradient (``predict = exp(score - lse) -> 0`` and
+        # ``log_clip_mask -> 0``), so the row contributes exactly nothing.
+        # Zeroing ``attn_l1norm`` instead would leave the target clamp
+        # ``max(target, exp(-100))`` behind as a residue.
+        index_lse = paddle.where(
+            row_active, index_lse, paddle.full_like(index_lse, float("inf"))
+        )
+        attn_score, attn_l1norm = dense_attn_kl_scores(
+            query,
+            kv,
+            attn_lse,
+            plan.softmax_scale,
+            **thd,
+        )
+        # Masked columns come back as ``-inf``; the kernel would survive them
+        # (``log_clip_mask`` is 0 there) but the clamp on a ``-inf`` target is
+        # not worth relying on, and this costs one pass over a matrix that is
+        # about to be consumed in place anyway.
+        attn_score = attn_score.clip_(min=0.0)
+
+        scale = DSAIndexerLossAutoScaler._main_loss_backward_scale
+        grad_loss = 1.0 if scale is None else scale
+
+        grad_q, grad_weights, grad_k = dense_indexer_kl_bwd(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            attn_l1norm,
+            index_score,
+            index_lse,
+            loss_coeff=plan.loss_coeff,
+            grad_loss=grad_loss,
+            block_I=plan.block_I,
+            **thd,
+        )
+        if grad_q.dtype != index_q.dtype:
+            grad_q = grad_q.cast(index_q.dtype)
+        if grad_weights.dtype != weights.dtype:
+            grad_weights = grad_weights.cast(weights.dtype)
+        if grad_k.dtype != index_k.dtype:
+            grad_k = grad_k.cast(index_k.dtype)
+
+        grad_main = grad_output if ctx.output_needs_grad else None
+        # Tensor inputs in signature order: output, index_q, weights, index_k,
+        # query, kv, attn_lse, row_active. The last four are recompute inputs
+        # only -- they arrive detached, so ``None`` is the required answer.
+        return (
+            grad_main,
+            grad_q,
+            grad_weights,
+            grad_k,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 @dataclass
@@ -250,10 +455,12 @@ class MQADocMeta:
     doc_len_per_pos: Tensor
     is_valid: Tensor
     doc_lens: Tensor
+    doc_starts: Tensor
     _window_topk_idxs: Tensor | None = None
     _window_size: int | None = None
     _valid_range: dict[int, tuple[Tensor, Tensor]] | None = None
     _cu_seqlens_arg: tuple[list[int] | None] | None = None
+    _segment_lens: list[int] | None = None
 
     @classmethod
     def build(
@@ -270,7 +477,7 @@ class MQADocMeta:
                     [batch_size, 1, seqlen, 1], seqlen, dtype="int32"
                 )
             _validate_csa_docmask_shape(row_end, batch_size, seqlen)
-            doc_start, doc_len, is_valid, doc_lens, _ = (
+            doc_start, doc_len, is_valid, doc_lens, doc_starts = (
                 _derive_csa_doc_boundaries(row_end, seqlen)
             )
         return cls(
@@ -280,6 +487,7 @@ class MQADocMeta:
             doc_len_per_pos=doc_len,
             is_valid=is_valid,
             doc_lens=doc_lens,
+            doc_starts=doc_starts,
         )
 
     # ------------------------------------------------------------------
@@ -376,6 +584,17 @@ class MQADocMeta:
             )
         return self._cu_seqlens_arg[0]
 
+    def doc_segment_lens(self) -> list[int]:
+        """Host-side segment lengths that tile ``[0, seqlen)``.
+
+        What the dense warmup KL needs instead of ``cu_seqlens_arg``: see
+        :func:`_doc_segment_lens` for why the borders come from the starts and
+        not from ``doc_lens``. Cached for the same reason -- it is a D2H sync.
+        """
+        if self._segment_lens is None:
+            self._segment_lens = _doc_segment_lens(self.doc_starts, self.seqlen)
+        return self._segment_lens
+
     def warm(self, window_size: int) -> None:
         """Build the cheap tables now so no layer builds them inside the forward.
 
@@ -401,6 +620,7 @@ class MQADocMeta:
         self._global_valid_range(window_size)
         self._global_valid_range(0)
         self.cu_seqlens_arg()
+        self.doc_segment_lens()
 
 
 class MQALatentAttention(FleetLayer):
@@ -699,7 +919,7 @@ class MQALatentAttention(FleetLayer):
         # kernel as the mask, so it is needed either way, and normalising it is
         # ``O(1)`` -- the part worth sharing is ``_derive_csa_doc_boundaries``.
         meta = None
-        doc_start = doc_len = is_valid = doc_lens = None
+        doc_start = doc_len = is_valid = doc_lens = doc_starts = None
         if docmask_mb_idx >= 0 and getattr(
             self.config, "mqa_share_docmask_meta", False
         ):
@@ -712,7 +932,7 @@ class MQALatentAttention(FleetLayer):
             )
         if meta is None:
             with paddle.no_grad():
-                doc_start, doc_len, is_valid, doc_lens, _ = (
+                doc_start, doc_len, is_valid, doc_lens, doc_starts = (
                     _derive_csa_doc_boundaries(row_end, s_global)
                 )
 
@@ -736,6 +956,7 @@ class MQALatentAttention(FleetLayer):
                 doc_start,
                 doc_len,
                 is_valid,
+                doc_starts,
                 kv_lora_rank,
                 input_ids,
                 position_offset,
@@ -806,6 +1027,7 @@ class MQALatentAttention(FleetLayer):
         doc_start: Tensor,
         doc_len: Tensor,
         is_valid: Tensor,
+        doc_starts: Tensor,
         kv_lora_rank: int,
         input_ids: Tensor | None,
         position_offset: int,
@@ -846,9 +1068,24 @@ class MQALatentAttention(FleetLayer):
         over the global sequence and row-sliced, and ``valid_rows`` is the global
         valid-row count -- so the per-rank losses sum to the single-rank one and
         no ``/cp_size`` correction is needed.
-        """
-        from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
 
+        Two KL backends, chosen by ``config.csa_indexer_backend``:
+
+        * ``"tilelang"`` (default) -- the single ``csa_indexer_topk_fwd`` call
+          described above. Its two bitonic buffers make the shared-memory
+          request proportional to the candidate width, so it stops at
+          ``_TILELANG_KL_MAX_WIDTH``;
+        * ``"cudnn"`` -- the dense cuDNN triple, which has no top-k stage and
+          therefore neither the shared-memory wall nor an ``[s, width]`` tensor
+          that has to survive into the backward. See
+          :meth:`_warmup_kl_dense_cudnn`.
+
+        Both compute the same objective; the switch is a memory/width trade, not
+        a change of loss. The field's third value, ``"unfused"``, has no
+        full-candidate implementation of its own and is served by tilelang --
+        explicitly, and with tilelang's width and head-count limits still
+        enforced by name.
+        """
         output = self._forward_full_causal(
             query,
             kv,
@@ -859,8 +1096,37 @@ class MQALatentAttention(FleetLayer):
         if not self._needs_indexer_loss():
             return output
 
+        backend = self.config.csa_indexer_backend
+        if backend == "cudnn":
+            return self._warmup_kl_dense_cudnn(
+                output,
+                query,
+                kv,
+                x,
+                qr,
+                doc_start,
+                is_valid,
+                doc_starts,
+                input_ids,
+                position_offset,
+                s_local,
+                s_global,
+                meta=meta,
+            )
+        # ``__post_init__`` narrowed the field to {unfused, tilelang, cudnn}, so
+        # everything left here is ``tilelang`` or ``unfused``, and both are
+        # served by tilelang: this phase's KL never had a pure-paddle
+        # implementation to offer as ``unfused`` (the reference
+        # ``FusedDSAIndexerLoss`` is a top-k loss, not a full-candidate one), and
+        # several existing hybrid-MLA suites configure ``unfused`` while running
+        # this path. Tilelang's own two limits are not silent under that name:
+        # the check below runs before the import and raises naming the width or
+        # head bound and pointing at ``"cudnn"``.
+        self._check_tilelang_indexer_support(s_global)
+
+        from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
+
         b = int(query.shape[0])
-        self._check_tilelang_indexer_support()
         index_q, index_k, weights = self._indexer_projections(
             x, qr, position_offset, grad_enabled=True
         )
@@ -955,22 +1221,304 @@ class MQALatentAttention(FleetLayer):
             loss_mask,
         )
 
-    def _check_tilelang_indexer_support(self) -> None:
-        """Fail loudly on the one tilelang indexer constraint we cannot absorb.
+    # ------------------------------------------------------------------
+    # warmup KL, dense (full-candidate cuDNN) backend
+    # ------------------------------------------------------------------
+    def _warmup_kl_dense_cudnn(
+        self,
+        output: Tensor,
+        query: Tensor,
+        kv: Tensor,
+        x: Tensor,
+        qr: Tensor,
+        doc_start: Tensor,
+        is_valid: Tensor,
+        doc_starts: Tensor,
+        input_ids: Tensor | None,
+        position_offset: int,
+        s_local: int,
+        s_global: int,
+        meta: MQADocMeta | None = None,
+    ) -> Tensor:
+        """Phase-2 KL over every causal candidate, on the dense cuDNN triple.
 
-        The top-k *width* needs no check: the wrappers round ``topk_effective``
-        up to a power-of-two multiple of their block and crop the result back
-        (``csa_indexer_fwd.py:430-462``, ``csa_indexer_bwd.py:617-638``), so any
-        causal span from 1 upwards is served -- measured at
-        s = 1/2/4/8/16/32/300/384/512/8192.
+        Same objective as the tilelang branch, and deliberately the same
+        arithmetic: identical KL expression, identical ``_EPS``, identical
+        denominator convention. What changes is where the ``[s_local, width]``
+        matrices live -- transient inside this forward and *recomputed* in the
+        backward, rather than carried across by the autoscaler. At 64k/cp=8 that
+        is two temporaries against three resident 2 GiB tensors per layer, and it
+        is what removes the tilelang shared-memory ceiling entirely.
 
-        The head count is different: ``index_n_heads`` other than 64 trips the
-        kernel's warp tiling with a bare
-        ``Check failed: (m_warp * n_warp == num_warps)`` from inside tilelang
-        (measured with 8). Reject that here rather than at the launch. It is not
-        checked at config time on purpose -- that would make every
-        small-geometry unit fixture unrepresentable.
+        Row gating collapses into a single ``row_active [s_local]``: a row is in
+        the loss when its document is real (``is_valid``) *and* its token is not
+        padding (``loss_mask``). With ``window=0`` those are exactly the rows the
+        tilelang branch keeps, since ``row_empty == ~is_valid`` there. Setting
+        ``attn_lse = +inf`` on an inactive row zeroes its whole attention-score
+        row, hence ``target == 0`` and a zero KL term -- no separate mask
+        multiply. The backward additionally forces ``index_lse = +inf`` there,
+        which zeroes that row's gradient exactly.
+
+        THD, not BSHD, even though the batch is always 1: the dense op's BSHD
+        mode takes one ``q_causal_offsets`` entry per *batch* element
+        (``_interface_sm100.py:748``), so it can only express a single causal
+        span for the whole packed sequence. ``cu_seqlens`` is what makes
+        per-document masking -- and the CP left border -- expressible at all, and
+        it also compacts ``max_seqlen_k`` to the longest visible document. The
+        layout change itself is free: ``[1, s, ...] -> [s, ...]`` is a view.
         """
+        from paddlefleet.cudnn_ops import (
+            dense_attn_kl_scores,
+            dense_indexer_kl_scores,
+            dense_kl_cu_seqlens,
+        )
+
+        self._check_cudnn_dense_indexer_support()
+        # Prebuilt shared metadata, when the trainer made one: the tables it
+        # holds are the very same global ones the inline path derives, so only
+        # the source changes here -- and the segment-length D2H has already been
+        # paid off the pipeline schedule.
+        if meta is not None:
+            doc_start, is_valid = meta.doc_start_per_pos, meta.is_valid
+            segment_lens = meta.doc_segment_lens()
+        else:
+            segment_lens = _doc_segment_lens(doc_starts, s_global)
+        # Left pre-baked, unlike the tilelang branch: the dense score is called
+        # with ``sm_scale=1.0``, which skips the un-bake/re-bake bf16 round trip
+        # (measured max_rel 8e-7 against an fp32 reference, versus 4.2e-4 when
+        # un-baked). ``d_weights`` therefore comes back in pre-baked space too.
+        index_q, index_k, weights = self._indexer_projections(
+            x, qr, position_offset, grad_enabled=True
+        )
+        # Grad-carrying THD views: slicing off the batch axis is differentiable,
+        # so the gradients this returns still reach the indexer parameters, and
+        # the ``PyLayer`` gets tensors whose shape already matches what the dense
+        # ops (and hence their gradients) use.
+        iq, ik, iw = index_q[0], index_k[0], weights[0]
+        query_thd, kv_thd = query[0].detach(), kv[0].detach()
+        with paddle.no_grad():
+            loss_mask, valid_rows = self._indexer_loss_mask(
+                input_ids, 1, s_local
+            )
+            row_active = is_valid[position_offset : position_offset + s_local]
+            if loss_mask is None:
+                # ``kl.mean()`` on the tilelang side divides by *every* row,
+                # doc-invalid ones included (they contribute 0). Same here.
+                num_rows = float(s_local)
+                coeff = self.indexer_loss_coeff / self.cp_size
+            else:
+                row_active = row_active & (loss_mask.reshape([s_local]) > 0)
+                num_rows = float(valid_rows)
+                coeff = self.indexer_loss_coeff
+
+            cu_q, cu_k, max_q, max_k, q_off = dense_kl_cu_seqlens(
+                segment_lens,
+                position_offset,
+                s_local,
+            )
+            thd = {
+                "cu_seqlens_q": cu_q,
+                "cu_seqlens_k": cu_k,
+                "max_seqlen_q": max_q,
+                "max_seqlen_k": max_k,
+                "q_causal_offsets": q_off,
+            }
+            attn_lse = self._dense_kl_attn_lse(
+                query_thd, kv_thd, doc_start, position_offset, row_active
+            )
+            index_score, index_lse = dense_indexer_kl_scores(
+                iq.detach(), ik.detach(), iw.detach(), **thd
+            )
+            attn_score, attn_l1norm = dense_attn_kl_scores(
+                query_thd, kv_thd, attn_lse, self.softmax_scale, **thd
+            )
+            loss = (
+                self._dense_kl_reduce(
+                    index_score,
+                    index_lse,
+                    # Masked columns come back as ``-inf``; clip before they
+                    # reach the division by ``attn_l1norm``.
+                    attn_score.clip_(min=0.0),
+                    attn_l1norm,
+                    num_rows,
+                )
+                * coeff
+            )
+            del index_score, index_lse, attn_score, attn_l1norm
+
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=loss,
+            layer_number=self.layer_number,
+            num_layers=DSAIndexerLossLoggingHelper.get_total_num_layers(
+                self.config
+            ),
+        )
+        plan = DenseWarmupKLPlan(
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_k,
+            q_causal_offsets=q_off,
+            # ``dense_indexer_kl_bwd`` hardcodes ``/ total_q`` (= ``s_local``)
+            # inside the kernel, so pre-multiply to land on the ``/ num_rows``
+            # this forward actually used. Same compensation as
+            # ``csa_attention.py:1338-1349``.
+            loss_coeff=coeff * s_local / num_rows,
+            softmax_scale=self.softmax_scale,
+        )
+        return DenseWarmupIndexerLossAutoScaler.apply(
+            output,
+            iq,
+            iw,
+            ik,
+            query_thd,
+            kv_thd,
+            attn_lse,
+            row_active,
+            plan,
+        )
+
+    def _dense_kl_attn_lse(
+        self, query, kv, doc_start, position_offset, row_active
+    ) -> Tensor:
+        """``[s_local, h]`` fp32 per-head LSE over the KL candidate set.
+
+        ``dense_attn_kl_scores`` needs the true per-head log-sum-exp *over the
+        same candidate set* to produce the uniform head mixture the DSA KL
+        targets; any other per-head constant silently yields a mass-weighted
+        mixture instead. It cannot be taken from the attention forward: the
+        flashmask facade flattens its LSE to ``[b, s]``
+        (``flash_mask_facade.py:205``), which cannot hold a per-head one. And the
+        candidate set is narrower than the attention's anyway -- no forced window,
+        no sink -- so even a per-head FA4 LSE would be the wrong normaliser
+        (measured gap 4.4e-3 at the production sink init; see
+        :meth:`_attn_target`).
+
+        So it is computed here, chunked over query rows. The logits are a bf16
+        matmul rounded to bf16 on output while the cuDNN kernel scores in fp32;
+        that shows up as a sub-percent per-head mass error, inside the band bf16
+        reduction reordering already occupies on this path.
+        """
+        h, s_global = int(query.shape[1]), int(kv.shape[0])
+        s_local = int(query.shape[0])
+        seg_start = doc_start[position_offset : position_offset + s_local]
+        rows = paddle.arange(
+            position_offset, position_offset + s_local, dtype="int64"
+        )
+        chunk = max(1, _LSE_CHUNK_ELEMS // max(h * s_global, 1))
+        parts = []
+        for beg in range(0, s_local, chunk):
+            end = min(beg + chunk, s_local)
+            # Columns past the chunk's last row can never be in range, so the
+            # matmul only covers ``[0, k_end)``. Under CP this is what keeps the
+            # first rank from scoring the whole gathered KV.
+            k_end = position_offset + end
+            logits = paddle.matmul(
+                query[beg:end], kv[:k_end], transpose_y=True
+            ).astype("float32")
+            cols = paddle.arange(k_end, dtype="int64").unsqueeze(0)
+            keep = (cols >= seg_start[beg:end].unsqueeze(1)) & (
+                cols <= rows[beg:end].unsqueeze(1)
+            )
+            # Additive rather than ``where``: broadcasting an ``[c, 1, k]`` bias
+            # over ``[c, h, k]`` needs no shape gymnastics, and ``_NEG_INF``
+            # rather than ``-inf`` keeps the sum away from ``nan``.
+            bias = paddle.where(
+                keep,
+                paddle.zeros_like(keep, dtype="float32"),
+                paddle.full(keep.shape, _NEG_INF, dtype="float32"),
+            ).unsqueeze(1)
+            parts.append(
+                paddle.logsumexp(logits * self.softmax_scale + bias, axis=-1)
+            )
+        lse = paddle.concat(parts, axis=0)
+        # ``+inf`` on an inactive row: ``exp(score - inf) == 0`` for every column,
+        # so the score row is all zeros and the row leaves the loss exactly.
+        return paddle.where(
+            row_active.unsqueeze(-1), lse, paddle.full_like(lse, float("inf"))
+        )
+
+    @staticmethod
+    def _dense_kl_reduce(
+        index_score, index_lse, attn_score, attn_l1norm, num_rows
+    ) -> Tensor:
+        """``sum(KL) / num_rows`` over the two dense score matrices, chunked.
+
+        Character-identical to the tilelang branch's reduction --
+        ``target * (log(target + _EPS) - log(probs + _EPS))`` summed over columns
+        -- so the two backends are comparable to the last epsilon. Masked columns
+        arrive as ``probs == 0`` (``exp(-inf - lse)``) and ``target == 0`` (the
+        caller clipped ``-inf`` away), whose term is an exact 0.
+        """
+        rows, width = (int(dim) for dim in index_score.shape)
+        chunk = max(1, _KL_CHUNK_ELEMS // max(width, 1))
+        total = paddle.zeros([], dtype="float32")
+        for beg in range(0, rows, chunk):
+            end = min(beg + chunk, rows)
+            probs = paddle.exp(
+                index_score[beg:end] - index_lse[beg:end].unsqueeze(-1)
+            )
+            target = attn_score[beg:end] / attn_l1norm[beg:end].unsqueeze(
+                -1
+            ).clip(min=_EPS)
+            log_ratio = paddle.log(target + _EPS) - paddle.log(probs + _EPS)
+            total = total + (target * log_ratio).sum()
+        return total / num_rows
+
+    def _check_cudnn_dense_indexer_support(self) -> None:
+        """The one dense-cuDNN constraint that is not implied by the layer.
+
+        ``DenseIndexerBackward.check_support`` rejects fewer than 64 index heads
+        outright (``dense_indexer_backward_sm100.py``), and unlike the forward it
+        does so from inside the backward, i.e. from a recompute replay. Reject it
+        here instead. The batch size needs no check -- ``forward`` already
+        requires 1.
+
+        Not a reason to point at tilelang: that path pins ``index_n_heads`` to
+        exactly 64 as well (see :meth:`_check_tilelang_indexer_support`), so a
+        narrower indexer has no warmup KL backend at all.
+        """
+        heads = int(self.indexer.n_heads)
+        if heads < 64:
+            raise ValueError(
+                "the dense cuDNN indexer backward requires index_n_heads >= 64, "
+                f"got {heads}. Raise index_n_heads to 64; the tilelang backend "
+                "requires exactly 64 too, so it is not a way around this."
+            )
+
+    def _check_tilelang_indexer_support(self, width: int) -> None:
+        """Fail loudly on the two tilelang indexer constraints we cannot absorb.
+
+        Neither is a config-time check, on purpose: both depend on the geometry
+        this layer is actually handed, and hoisting them would make every
+        small-geometry unit fixture unrepresentable.
+
+        **Width.** Any causal span is served *functionally* -- the wrappers round
+        ``topk_effective`` up to a power-of-two multiple of their block and crop
+        the result back (``csa_indexer_fwd.py:430-462``,
+        ``csa_indexer_bwd.py:617-638``), measured at
+        s = 1/2/4/8/16/32/300/384/512/8192. Shared memory is the real limit: the
+        two bitonic buffers are sized ``2 * topk``, so one block requests
+        ``16 * width + 25344`` B against the SM100 opt-in limit of 232448 B.
+        Past ``_TILELANG_KL_MAX_WIDTH`` the launch dies with a bare ``Failed to
+        set the allowed dynamic shared memory size`` raised from wherever the
+        segment is *replayed* (``recompute.py:389``), not from here, so reject it
+        at the call site and name the way out.
+
+        **Head count.** ``index_n_heads`` other than 64 trips the kernel's warp
+        tiling with a bare ``Check failed: (m_warp * n_warp == num_warps)`` from
+        inside tilelang (measured with 8).
+        """
+        if int(width) > _TILELANG_KL_MAX_WIDTH:
+            raise ValueError(
+                "the tilelang full-candidate indexer cannot cover a candidate "
+                f"width of {int(width)}: its shared-memory request "
+                f"({16 * int(width) + 25344} B) exceeds the device limit past "
+                f"{_TILELANG_KL_MAX_WIDTH} columns. Set "
+                'csa_indexer_backend="cudnn" to run the warmup KL on the dense '
+                "cuDNN indexer instead, which has no top-k stage and so no "
+                "width-proportional shared memory."
+            )
         heads = int(self.indexer.n_heads)
         if heads != 64:
             raise ValueError(
