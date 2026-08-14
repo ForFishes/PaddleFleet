@@ -68,17 +68,18 @@ localised and its values are local row ids, so no ``[b, s, s]`` table is an
 honest reconstruction and ``idx_cp is None`` there. Dense CP claims are therefore
 made against outputs, gradients and the bounds themselves.
 
-Run (2 or 4 GPUs)::
+Run (2 or 4 GPUs). The repository root has to be importable because the shared
+harness is imported through its package path (``ci/multi-card_test.sh`` puts it
+on ``PYTHONPATH`` for exactly that reason)::
 
-    PYTHONPATH=./third_party/PaddleFleet/src:./third_party/PaddleFormers \
+    PYTHONPATH=./third_party/PaddleFleet:./third_party/PaddleFleet/src:\
+./third_party/PaddleFormers \
     python -m paddle.distributed.launch --devices 0,1 --nnodes 1 \
         --master 127.0.0.1:<port> \
         third_party/PaddleFleet/tests/multi_card_tests/transformer/\
 test_mqa_dsa_warmup_cp.py
 """
 
-import os
-import sys
 import unittest
 from unittest import mock
 
@@ -86,19 +87,14 @@ import numpy as np
 import paddle
 import paddle.distributed as dist
 
-# The sibling harness is imported as a top-level module, so this directory has
-# to be on ``sys.path``. ``python <thisfile>`` -- what
-# ``paddle.distributed.launch`` runs -- puts it there as ``sys.path[0]``, but the
-# coverage-instrumented CI runner starts the same file as ``python -m coverage
-# run <abs path>``, where ``-m`` claims ``sys.path[0]`` for the CWD instead and
-# the import fails before a single test is collected. Add the file's own
-# directory explicitly so both entry points resolve it.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-import test_mqa_dsa_cp as H
-
 from paddlefleet.transformer.csa_attention import _derive_csa_doc_boundaries
 from paddlefleet.transformer.mqa_latent_attention import MQALatentAttention
+
+# Through the package path, not as a top-level sibling: the two entry points put
+# different things on ``sys.path[0]`` (``python <thisfile>`` this directory, the
+# coverage-instrumented CI runner's ``python -m coverage run <abs path>`` the
+# CWD), and the repository root is on ``PYTHONPATH`` under both.
+from tests.multi_card_tests.transformer import test_mqa_dsa_cp as H
 
 S_GLOBAL = H.S_GLOBAL
 _STRADDLE = H._STRADDLE
