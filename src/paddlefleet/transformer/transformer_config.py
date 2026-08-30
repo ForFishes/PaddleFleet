@@ -630,6 +630,47 @@ class TransformerConfig(ModelParallelConfig):
     asserts itself.
     """
 
+    mqa_latent_rope_adjacent_pairing: bool = False
+    """If True, the absorbed-MQA (``mqa_latent``) layers pair RoPE channels
+    ``(2k, 2k+1)`` instead of ``(k, k+half)``.
+
+    A **checkpoint-compatibility** switch, not a performance one: which two
+    channels share a frequency decides which frequency each learned channel of
+    ``q_b_proj`` / ``kv_a_proj`` gets, so the pairing is part of the meaning of
+    those weights.
+
+    An unabsorbed MLA layer under ``apply_rope_fusion`` runs
+    ``fused_apply_mla_rope_for_q`` / ``_for_kv``, which pair ``(2k, 2k+1)``.
+    Latent MQA makes the ``apply_rope_fusion and not self.mqa_latent`` test
+    in ``MLASelfAttention`` fall through, because ``_for_kv`` needs the
+    per-head K/V that absorption never materialises, and every path that
+    remains pairs
+    ``(k, k+half)``. Enabling absorption therefore silently permutes an MLA
+    checkpoint's channel-to-frequency map -- harmless where the backbone can
+    retrain, not harmless where it cannot (a frozen-backbone indexer warmup
+    distils a scrambled attention distribution; see ``train_indexer_only``).
+
+    Set it to keep the pairing across that switch. It reaches both paths: the
+    eager one via a per-call ``multi_latent_attention=True`` (the config field
+    itself cannot be flipped, since it also drives layer-spec selection and
+    position-embedding construction), the fused one via ``adjacent_in=True`` on
+    ``fused_apply_rope_half`` / ``fused_rope_cat_key``. Only the gather
+    positions move, so the arithmetic, the bf16 rounding and the half-split
+    *output* layout are identical and the two paths stay bit-exact with each
+    other. Output layout is left at half-split on purpose: it is q/k-symmetric
+    and therefore invisible to ``q @ k^T``.
+
+    Pairing is a within-head_dim property, so this is orthogonal to TP, SP, CP,
+    PP and EP.
+
+    Inert, and rejected by ``__post_init__``, where it cannot take effect: no
+    absorbed layers, or ``gpt_model_use_experimental_version``. Also rejected
+    with ``rotary_interleaved``, which expresses the same pairing by building a
+    different ``freqs`` layout; combining them would rotate twice. The HCA/CSA
+    (``ratio != -2``) layers pair ``(2k, 2k+1)`` already, via
+    ``fused_apply_mla_rope_inplace``, and are not touched.
+    """
+
     sigmoid_gate_fusion: bool = False
     """If True, use Triton fused sigmoid gate kernel."""
 
@@ -2435,6 +2476,48 @@ class TransformerConfig(ModelParallelConfig):
                     " -2 layers. Under the default 'mha' those layers are dense "
                     "MLA and build no MQADocMeta, so the switch would be a silent "
                     "no-op. Use csa_share_docmask_meta for the HCA/CSA layers."
+                )
+        if self.mqa_latent_rope_adjacent_pairing:
+            # Every failure mode here is silent: a config with no absorbed
+            # layers never reads the flag, and ``rotary_interleaved`` already
+            # expresses the same pairing through the ``freqs`` layout, so
+            # combining them rotates the (2k, 2k+1) pair twice and produces a
+            # plausible-looking but wrong result. Checked once, here.
+            ratios = [int(r) for r in (self.csa_compress_ratios or [])]
+            has_latent_mqa = (
+                self.hybrid_mla_attention in ("mqa_dsa", "mqa_full_causal")
+                and -2 in ratios
+            )
+            if not has_latent_mqa:
+                raise ValueError(
+                    "mqa_latent_rope_adjacent_pairing applies to the absorbed "
+                    "(latent) MQA layers, i.e. csa_compress_ratios entries "
+                    "equal to -2 under hybrid_mla_attention='mqa_dsa' or "
+                    "'mqa_full_causal', but this config has "
+                    f"hybrid_mla_attention={self.hybrid_mla_attention!r} and "
+                    f"{'some' if -2 in ratios else 'no'} -2 layers. Under "
+                    "'mha' those layers are unabsorbed MLA and already pair "
+                    "(2k, 2k+1) through apply_rope_fusion, so the switch would "
+                    "be a silent no-op."
+                )
+            if self.rotary_interleaved:
+                raise ValueError(
+                    "mqa_latent_rope_adjacent_pairing and rotary_interleaved "
+                    "both select the (2k, 2k+1) pairing, by different means: "
+                    "rotary_interleaved builds freqs so that channel i carries "
+                    "theta_(i//2) and _rotate_half slices 0::2 / 1::2, while "
+                    "this flag keeps the halved freqs layout and de-interleaves "
+                    "the input instead. Enabling both applies the rotation "
+                    "twice. Use rotary_interleaved alone if the whole model "
+                    "should be interleaved."
+                )
+            if self.gpt_model_use_experimental_version:
+                raise ValueError(
+                    "mqa_latent_rope_adjacent_pairing has no effect under "
+                    "gpt_model_use_experimental_version: that path routes the "
+                    "MLA layers through _ec_compatible_rope_apply, a complex "
+                    "rotation with its own pairing that neither branch of this "
+                    "switch reaches. It would be a silent no-op."
                 )
         if self.fuse_inv_rope_into_vha_postmix:
             # ``DSv4HybridAttention._can_fuse_inv_rope_postmix`` answers no by
